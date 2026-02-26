@@ -806,15 +806,7 @@ PROXY_ROUTES = '''
 from fastapi import WebSocket as _FastAPIWebSocket
 @app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
 async def sandbox_port_proxy(port: int, path: str, request: Request):
-    """Reverse proxy any sandbox port through openhands-app (port 3000).
-    VSCode (port 8001) flow:
-      1. GET /?tkn=TOKEN  -> VSCode returns 302 + Set-Cookie + Location:/
-         We rewrite Location: / -> Location: /api/sandbox-port/{port}/
-         so browser redirect stays within proxy.
-      2. Browser follows redirect with cookie -> GET /api/sandbox-port/{port}/
-         We serve VSCode HTML with all absolute paths rewritten to proxy-relative.
-      3. Browser loads workbench.js etc via /api/sandbox-port/{port}/stable-.../
-    """
+    """Reverse proxy any sandbox port through openhands-app (port 3000)."""
     import httpx as _hx, re as _re
     target = f"http://127.0.0.1:{port}/{path}"
     qs = str(request.query_params)
@@ -830,9 +822,9 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
                 method=request.method, url=target, headers=headers, content=body)
             resp_headers = {}
             for k, v in resp.headers.multi_items():
-                if k.lower() in ("content-encoding", "transfer-encoding", "connection"):
+                if k.lower() in ("content-encoding", "transfer-encoding", "connection",
+                                  "content-security-policy"):
                     continue
-                # Rewrite Location so browser redirect stays within proxy
                 if k.lower() == "location":
                     if v.startswith("http://127.0.0.1") or v.startswith("http://localhost"):
                         v = _re.sub(r"https?://[^/]+", proxy_base, v, count=1)
@@ -841,38 +833,26 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
                 resp_headers[k] = v
             content = resp.content
             ct = resp.headers.get("content-type", "")
-            # Rewrite HTML responses: fix absolute paths so they route through proxy
             if "text/html" in ct and content:
                 try:
                     html = content.decode("utf-8")
-                    # Rewrite absolute href/src to go through proxy
                     def _rewrite_abs(m):
                         attr, url = m.group(1), m.group(2)
                         if url.startswith(proxy_base):
                             return m.group(0)
                         return attr + proxy_base + url
                     html = _re.sub(
-                        r'((?:src|href|action)=["\'])(/[^/"\'#][^"\']*)',
-                        _rewrite_abs,
-                        html
-                    )
-                    # Fix serverBasePath in workbench config (HTML-encoded JSON)
+                        r"""((?:src|href|action)=["'])(/[^/"'#][^"']*)""",
+                        _rewrite_abs, html)
                     html = html.replace(
                         "&quot;serverBasePath&quot;:&quot;/&quot;",
-                        "&quot;serverBasePath&quot;:&quot;" + proxy_base + "/&quot;"
-                    )
-                    # Fix inline baseUrl script
+                        "&quot;serverBasePath&quot;:&quot;" + proxy_base + "/&quot;")
                     html = _re.sub(
                         r"(new URL\(')(/stable-[^']+)(')",
-                        lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3),
-                        html
-                    )
-                    # Clear remoteAuthority so VSCode uses same-origin WebSocket
+                        lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3), html)
                     html = _re.sub(
-                        r"&quot;remoteAuthority&quot;:&quot;127[^&]*&quot;",
-                        "&quot;remoteAuthority&quot;:&quot;&quot;",
-                        html
-                    )
+                        r"&quot;remoteAuthority&quot;:&quot;[^&]*&quot;",
+                        "&quot;remoteAuthority&quot;:&quot;&quot;", html)
                     content = html.encode("utf-8")
                 except Exception:
                     pass
@@ -991,6 +971,99 @@ print('exposed_urls 代理路径补丁已应用（保留 AGENT_SERVER 不变）�
 PYEOF
 sudo docker cp /tmp/patch_sandbox_exposed_urls.py openhands-app:/tmp/patch_sandbox_exposed_urls.py
 sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
+
+# ─── 补丁11：vscode-tab JS 修复 + z-suffix cache busting ───
+# 根因：new URL(r.url) 当 r.url 是相对路径时抛 TypeError → "Error parsing URL"
+# 修复：new URL(r.url, window.location.origin)
+# 由于 assets 被标记 immutable，需要创建新文件名（z 后缀）打破缓存链
+cat > /tmp/patch_vscode_tab.py << 'PYEOF'
+import os, shutil, re
+
+ASSETS = '/app/frontend/build/assets'
+
+# 1. Fix vscode-tab JS files (both - and x suffix)
+OLD_URL = 'if(r?.url)try{const f=new URL(r.url).protocol'
+NEW_URL = 'if(r?.url)try{const f=new URL(r.url,window.location.origin).protocol'
+
+for fname in ['vscode-tab-CFaq3Fn-.js', 'vscode-tab-CFaq3Fn-x.js']:
+    p = os.path.join(ASSETS, fname)
+    if not os.path.exists(p):
+        print(f'{fname}: not found, skipping')
+        continue
+    with open(p) as f:
+        src = f.read()
+    if NEW_URL in src:
+        print(f'{fname}: already patched ✓')
+    elif OLD_URL in src:
+        src = src.replace(OLD_URL, NEW_URL, 1)
+        with open(p, 'w') as f:
+            f.write(src)
+        print(f'{fname}: URL parse fix applied ✓')
+    else:
+        print(f'{fname}: WARNING pattern not found')
+
+# 2. Create z-suffix chain to bust immutable cache
+# vscode-tab-CFaq3Fn-x.js → vscode-tab-CFaq3Fn-z.js
+src_x = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-x.js')
+dst_z = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-z.js')
+if os.path.exists(src_x):
+    shutil.copy2(src_x, dst_z)
+    print('Created vscode-tab-CFaq3Fn-z.js ✓')
+
+# 3. Update conversation-uXvJtyCLx.js to reference vscode-tab-z
+conv_x = os.path.join(ASSETS, 'conversation-uXvJtyCLx.js')
+if os.path.exists(conv_x):
+    with open(conv_x) as f:
+        csrc = f.read()
+    if 'vscode-tab-CFaq3Fn-z.js' not in csrc:
+        csrc2 = csrc.replace('vscode-tab-CFaq3Fn-x.js', 'vscode-tab-CFaq3Fn-z.js')
+        if csrc2 != csrc:
+            with open(conv_x, 'w') as f:
+                f.write(csrc2)
+            print('Updated conversation-uXvJtyCLx.js: vscode-tab x→z ✓')
+        else:
+            print('WARNING: vscode-tab-x ref not found in conversation-uXvJtyCLx.js')
+    else:
+        print('conversation-uXvJtyCLx.js already refs vscode-tab-z ✓')
+
+# 4. Create conversation-uXvJtyCLz.js (copy of updated x)
+conv_z = os.path.join(ASSETS, 'conversation-uXvJtyCLz.js')
+if os.path.exists(conv_x):
+    shutil.copy2(conv_x, conv_z)
+    print('Created conversation-uXvJtyCLz.js ✓')
+
+# 5. Update conversation-fHdubO7Rz.js to import uXvJtyCLz
+conv_rz = os.path.join(ASSETS, 'conversation-fHdubO7Rz.js')
+if os.path.exists(conv_rz):
+    with open(conv_rz) as f:
+        rzc = f.read()
+    if 'uXvJtyCLz' not in rzc:
+        rzc2 = rzc.replace('conversation-uXvJtyCLx.js', 'conversation-uXvJtyCLz.js')
+        if rzc2 != rzc:
+            with open(conv_rz, 'w') as f:
+                f.write(rzc2)
+            print('Updated conversation-fHdubO7Rz.js: uXvJtyCLx→uXvJtyCLz ✓')
+    else:
+        print('fHdubO7Rz already refs uXvJtyCLz ✓')
+
+# 6. Update manifest-z to reference uXvJtyCLz
+mz = os.path.join(ASSETS, 'manifest-8c9a7105z.js')
+if os.path.exists(mz):
+    with open(mz) as f:
+        mzc = f.read()
+    if 'uXvJtyCLz' not in mzc:
+        mzc2 = mzc.replace('conversation-uXvJtyCLx.js', 'conversation-uXvJtyCLz.js')
+        if mzc2 != mzc:
+            with open(mz, 'w') as f:
+                f.write(mzc2)
+            print('Updated manifest-z: uXvJtyCLx→uXvJtyCLz ✓')
+    else:
+        print('manifest-z already refs uXvJtyCLz ✓')
+
+print('Chain: manifest-z → fHdubO7Rz → uXvJtyCLz → vscode-tab-z ✓')
+PYEOF
+sudo docker cp /tmp/patch_vscode_tab.py openhands-app:/tmp/patch_vscode_tab.py
+sudo docker exec openhands-app python3 /tmp/patch_vscode_tab.py
 
 # ─── 重启 openhands-app 使所有 Python 补丁生效 ───
 echo ""
@@ -1121,8 +1194,9 @@ echo "  - /api/proxy/events SSE 路由（klogin 可转发，修复 V1 Disconnect
 echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
 echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
-echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问）"
+echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问，CSP stripped, remoteAuthority cleared）"
 echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
+echo "  - vscode-tab URL parse fix（new URL relative path fix + z-suffix cache busting）"
 echo "  - git-service.js poll 修复（V1 新建会话直接返回真实 conversation_id）"
 echo "  - task-nav-fix（index.html 兜底脚本，确保浏览器缓存情况下也能跳转会话）"
 echo "  - cache busting z-suffix（manifest/conversation JS 全新 URL，清除旧 immutable 缓存）"
