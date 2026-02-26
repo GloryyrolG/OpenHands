@@ -138,6 +138,7 @@ sudo docker run -d --pull=always \
   -e AGENT_SERVER_IMAGE_TAG=1.10.0-python \
   -e LOG_ALL_EVENTS=true \
   -e SANDBOX_STARTUP_GRACE_SECONDS=120 \
+  -e AGENT_SERVER_PORT_RANGE_START=13000 -e AGENT_SERVER_PORT_RANGE_END=14000 \
   -e 'SANDBOX_CONTAINER_URL_PATTERN=http://127.0.0.1:{port}' \
   -e OH_WEB_URL='http://127.0.0.1:3002' \
   -e ENABLE_MCP=false \
@@ -319,19 +320,42 @@ async def proxy_websocket(websocket: WebSocket, conversation_id: str):
             pass
 
 
-# ── POST events via WebSocket（核心！HTTP POST 不唤醒 asyncio queue）──
+# ── POST events：旧 action 格式转换为 agent-server v1.10.0-python SDK 格式后 HTTP POST ──
+def _convert_action_to_sdk_message(body: bytes) -> bytes:
+    """Convert old OpenHands action format to agent-server v1.10.0-python SendMessageRequest format."""
+    import json as _json
+    try:
+        data = _json.loads(body)
+        if data.get('action') == 'message' and 'args' in data:
+            content_str = data['args'].get('content', '')
+            image_urls = data['args'].get('image_urls') or []
+            content_items: list = [{'type': 'text', 'text': content_str}]
+            for url in image_urls:
+                content_items.append({'type': 'image_url', 'image_url': {'url': url}})
+            return _json.dumps({
+                'role': 'user',
+                'content': content_items,
+                'run': True,
+            }).encode()
+    except Exception:
+        pass
+    return body
+
+
 @agent_proxy_router.post('/api/conversations/{conversation_id}/events')
 async def proxy_send_event_ws(conversation_id: str, request: Request):
     base_url = _resolve_url(f'/conversations/{conversation_id}')
     params = dict(request.query_params)
     key = request.headers.get('X-Session-API-Key', '') or params.get('session_api_key', '')
     body = await request.body()
-    ws_url = f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+    send_body = _convert_action_to_sdk_message(body)
+    url = f"{base_url}/api/conversations/{conversation_id}/events"
+    headers: dict = {'Content-Type': 'application/json'}
     if key:
-        ws_url += f'?session_api_key={key}'
+        headers['X-Session-API-Key'] = key
     try:
-        async with websockets.connect(ws_url) as ws:
-            await ws.send(body.decode())
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(url, content=send_body, headers=headers)
     except Exception:
         pass
     return Response(content='{"success":true}', status_code=200, media_type='application/json')
@@ -366,7 +390,7 @@ cat > /tmp/bridge_patch_app.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if 'agent_server_proxy' in src and 'api/proxy/events' in src and 'Must send via WebSocket' in src:
+if 'agent_server_proxy' in src and 'api/proxy/events' in src and '_convert_action_to_sdk_message_bridge' in src:
     print('app.py 所有路由已存在 ✓')
     exit(0)
 
@@ -385,11 +409,9 @@ else:
     print('agent_proxy_router 已存在，跳过 ✓')
 
 # 注入 /api/proxy/events SSE + send 路由
-if 'api/proxy/events' not in src or 'Must send via WebSocket' not in src:
+if 'api/proxy/events' not in src or '_convert_action_to_sdk_message_bridge' not in src:
     MARKER = 'app.include_router(agent_proxy_router)'
     new_routes = '''
-_AGENT_WS = 'ws://127.0.0.1:8000'  # bridge 模式下由 proxy 动态解析，此处仅备用
-
 @app.get("/api/proxy/events/{conversation_id}/stream", include_in_schema=False)
 async def api_proxy_events_stream(request: Request, conversation_id: str):
     import websockets as _ws
@@ -415,20 +437,42 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     return _SR(_gen(), media_type="text/event-stream",
                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+def _convert_action_to_sdk_message_bridge(body: bytes) -> bytes:
+    """Convert old OpenHands action format to agent-server v1.10.0-python SendMessageRequest format."""
+    import json as _json
+    try:
+        data = _json.loads(body)
+        if data.get("action") == "message" and "args" in data:
+            content_str = data["args"].get("content", "")
+            image_urls = data["args"].get("image_urls") or []
+            content_items: list = [{"type": "text", "text": content_str}]
+            for url in image_urls:
+                content_items.append({"type": "image_url", "image_url": {"url": url}})
+            return _json.dumps({
+                "role": "user",
+                "content": content_items,
+                "run": True,
+            }).encode()
+    except Exception:
+        pass
+    return body
+
 @app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)
 async def api_proxy_send_event(conversation_id: str, request: Request):
-    # Must send via WebSocket to wake up Python agent's asyncio queue.
-    import websockets as _ws
-    from openhands.server.routes.agent_server_proxy import _resolve_url, _to_ws
+    # Convert old OpenHands action format to SDK SendMessageRequest, then HTTP POST to agent-server.
+    from openhands.server.routes.agent_server_proxy import _resolve_url
     body = await request.body()
     key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")
+    send_body = _convert_action_to_sdk_message_bridge(body)
     base_url = _resolve_url(f"/conversations/{conversation_id}")
-    ws_url = f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+    url = f"{base_url}/api/conversations/{conversation_id}/events"
+    headers = {"Content-Type": "application/json"}
     if key:
-        ws_url += f"?session_api_key={key}"
+        headers["X-Session-API-Key"] = key
     try:
-        async with _ws.connect(ws_url) as ws:
-            await ws.send(body.decode())
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(url, content=send_body, headers=headers)
     except Exception:
         pass
     return JSONResponse({"success": True})
