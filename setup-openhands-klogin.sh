@@ -1057,65 +1057,74 @@ for fname in ['vscode-tab-CFaq3Fn-.js', 'vscode-tab-CFaq3Fn-x.js']:
     else:
         print(f'{fname}: WARNING pattern not found')
 
-# 2. Create z-suffix chain to bust immutable cache
-# vscode-tab-CFaq3Fn-x.js → vscode-tab-CFaq3Fn-z.js
+# 2. Create vscode-tab-CFaq3Fn-z.js from patched original (prefer x if exists)
 src_x = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-x.js')
+src_orig = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-.js')
 dst_z = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-z.js')
-if os.path.exists(src_x):
-    shutil.copy2(src_x, dst_z)
-    print('Created vscode-tab-CFaq3Fn-z.js ✓')
+vt_src = src_x if os.path.exists(src_x) else src_orig
+if os.path.exists(vt_src):
+    shutil.copy2(vt_src, dst_z)
+    print(f'Created vscode-tab-CFaq3Fn-z.js (from {os.path.basename(vt_src)}) ✓')
+else:
+    print('WARNING: no vscode-tab source found')
 
-# 3. Update conversation-uXvJtyCLx.js to reference vscode-tab-z
-conv_x = os.path.join(ASSETS, 'conversation-uXvJtyCLx.js')
-if os.path.exists(conv_x):
-    with open(conv_x) as f:
+# 3. Determine uXvJtyCL source (prefer x if exists, fall back to plain)
+conv_x    = os.path.join(ASSETS, 'conversation-uXvJtyCLx.js')
+conv_orig = os.path.join(ASSETS, 'conversation-uXvJtyCL.js')
+conv_src  = conv_x if os.path.exists(conv_x) else conv_orig
+
+# 4. Create conversation-uXvJtyCLz.js (copy of best available source)
+conv_z = os.path.join(ASSETS, 'conversation-uXvJtyCLz.js')
+if os.path.exists(conv_src):
+    shutil.copy2(conv_src, conv_z)
+    print(f'Created conversation-uXvJtyCLz.js (from {os.path.basename(conv_src)}) ✓')
+else:
+    print('WARNING: no conversation-uXvJtyCL source found')
+
+# 5. Update uXvJtyCLz.js to reference vscode-tab-z (replace all vscode-tab- variants)
+if os.path.exists(conv_z):
+    with open(conv_z) as f:
         csrc = f.read()
     if 'vscode-tab-CFaq3Fn-z.js' not in csrc:
         csrc2 = csrc.replace('vscode-tab-CFaq3Fn-x.js', 'vscode-tab-CFaq3Fn-z.js')
-        if csrc2 != csrc:
-            with open(conv_x, 'w') as f:
-                f.write(csrc2)
-            print('Updated conversation-uXvJtyCLx.js: vscode-tab x→z ✓')
-        else:
-            print('WARNING: vscode-tab-x ref not found in conversation-uXvJtyCLx.js')
+        csrc2 = csrc2.replace('vscode-tab-CFaq3Fn-.js', 'vscode-tab-CFaq3Fn-z.js')
+        with open(conv_z, 'w') as f:
+            f.write(csrc2)
+        print('Updated uXvJtyCLz.js: vscode-tab → vscode-tab-z ✓')
     else:
-        print('conversation-uXvJtyCLx.js already refs vscode-tab-z ✓')
+        print('uXvJtyCLz.js already refs vscode-tab-z ✓')
 
-# 4. Create conversation-uXvJtyCLz.js (copy of updated x)
-conv_z = os.path.join(ASSETS, 'conversation-uXvJtyCLz.js')
-if os.path.exists(conv_x):
-    shutil.copy2(conv_x, conv_z)
-    print('Created conversation-uXvJtyCLz.js ✓')
-
-# 5. Update conversation-fHdubO7Rz.js to import uXvJtyCLz
+# 6. Update conversation-fHdubO7Rz.js to import uXvJtyCLz
 conv_rz = os.path.join(ASSETS, 'conversation-fHdubO7Rz.js')
 if os.path.exists(conv_rz):
     with open(conv_rz) as f:
         rzc = f.read()
     if 'uXvJtyCLz' not in rzc:
         rzc2 = rzc.replace('conversation-uXvJtyCLx.js', 'conversation-uXvJtyCLz.js')
+        rzc2 = rzc2.replace('conversation-uXvJtyCL.js', 'conversation-uXvJtyCLz.js')
         if rzc2 != rzc:
             with open(conv_rz, 'w') as f:
                 f.write(rzc2)
-            print('Updated conversation-fHdubO7Rz.js: uXvJtyCLx→uXvJtyCLz ✓')
+            print('Updated conversation-fHdubO7Rz.js → uXvJtyCLz ✓')
     else:
         print('fHdubO7Rz already refs uXvJtyCLz ✓')
 
-# 6. Update manifest-z to reference uXvJtyCLz
+# 7. Update manifest-z to reference uXvJtyCLz (for modulepreload hints)
 mz = os.path.join(ASSETS, 'manifest-8c9a7105z.js')
 if os.path.exists(mz):
     with open(mz) as f:
         mzc = f.read()
     if 'uXvJtyCLz' not in mzc:
         mzc2 = mzc.replace('conversation-uXvJtyCLx.js', 'conversation-uXvJtyCLz.js')
+        mzc2 = mzc2.replace('conversation-uXvJtyCL.js', 'conversation-uXvJtyCLz.js')
         if mzc2 != mzc:
             with open(mz, 'w') as f:
                 f.write(mzc2)
-            print('Updated manifest-z: uXvJtyCLx→uXvJtyCLz ✓')
+            print('Updated manifest-z → uXvJtyCLz ✓')
     else:
         print('manifest-z already refs uXvJtyCLz ✓')
 
-print('Chain: manifest-z → fHdubO7Rz → uXvJtyCLz → vscode-tab-z ✓')
+print('Chain: manifest-z → fHdubO7Rz → uXvJtyCLz → BMHPx + vscode-tab-z ✓')
 PYEOF
 sudo docker cp /tmp/patch_vscode_tab.py openhands-app:/tmp/patch_vscode_tab.py
 sudo docker exec openhands-app python3 /tmp/patch_vscode_tab.py
