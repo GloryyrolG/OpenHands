@@ -16,11 +16,15 @@ bash setup-openhands-klogin.sh
 
 ```
 浏览器 → klogin ingress (剥离 WS Upgrade) → openhands-app (Python, port 3000)
-                                                  ├── /api/*           → V0/V1 API
-                                                  ├── /agent-server-proxy/* → 反向代理到 agent-server
-                                                  └── /api/proxy/*     → SSE/WS 事件路由
+                                                  ├── /api/*                  → V0/V1 API
+                                                  ├── /agent-server-proxy/*   → 反向代理到 agent-server
+                                                  ├── /api/proxy/*            → SSE/WS 事件路由
+                                                  └── /api/sandbox-port/{port}/* → VSCode/App tab 反代
                                                           ↓
                                               agent-server (Go binary, port 8000)
+                                                  ├── port 8001: VSCode 编辑器
+                                                  ├── port 8011: App Worker 1
+                                                  └── port 8012: App Worker 2
                                                           ↓
                                               sandbox 容器 (tmux session)
                                                           ↓
@@ -41,6 +45,8 @@ bash setup-openhands-klogin.sh
 | 6 | /api/proxy/events 路由 | `app.py` | klogin 只转发 /api/*，SSE 事件流走此路径 |
 | 7 | index.html FakeWS | `index.html` | 全局 WS 拦截→SSE，绕过 klogin 缓存 |
 | 8 | per-conversation workspace | `live_status_app_conversation_service.py` | 每会话独立工作目录 |
+| 9 | sandbox port proxy | `app.py` | 注入 `/api/sandbox-port/{port}/*` 反代，让浏览器访问 VSCode/App tab |
+| 10 | exposed_urls 重写 | `docker_sandbox_service.py` | VSCODE/WORKER URL 改为 `/api/sandbox-port/{port}`；AGENT_SERVER 保持绝对 URL |
 
 ### 补丁8 详细说明：Per-Conversation 工作目录隔离
 
@@ -49,6 +55,26 @@ bash setup-openhands-klogin.sh
 **方案**：在 `_start_app_conversation()` 中，为每个会话创建 `/workspace/project/{task.id.hex}/` 子目录并 git init。后续 `remote_workspace` 和 `start_conversation_request` 均使用此子目录。
 
 **效果**：软隔离——每个会话默认在自己目录工作，技术上仍可 `cd ..` 看到其他会话（同一 Linux 用户）。
+
+### 补丁9+10 详细说明：Code/App tab 访问（sandbox port proxy）
+
+**问题**：OpenHands 侧边栏的 Code tab（VSCode 编辑器）和 App tab（应用预览）通过 `exposed_urls` 中的 `http://127.0.0.1:{port}` URL 打开 iframe。klogin 用户的浏览器无法直接访问远程机器的 127.0.0.1，导致这些 tab 显示空白或报错。
+
+**方案**：
+- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由，作为 HTTP/WebSocket 反向代理。浏览器请求经 klogin → openhands-app（3000端口）→ 转发到容器内 `http://127.0.0.1:{port}`。
+- **补丁10**：在 `_container_to_sandbox_info()` 中，返回 `SandboxInfo` 前将 VSCODE/WORKER 的 `exposed_urls` 从 `http://127.0.0.1:{port}` 改写为 `/api/sandbox-port/{port}`。AGENT_SERVER URL 保持绝对路径不变（`_container_to_checked_sandbox_info()` health check 需要）。
+
+**验证**：
+```bash
+# sandbox port proxy 是否存在（需要 sandbox 在运行中）
+curl -s http://localhost:3001/api/sandbox-port/8001/?tkn=<session_api_key>&folder=/workspace/project
+# → 应返回 200 OK + VSCode HTML
+
+# exposed_urls 是否正确重写
+curl -s "http://localhost:3001/api/v1/sandboxes?id=<sandbox_id>" | python3 -m json.tool
+# VSCODE.url 应为 /api/sandbox-port/8001/...（不是 http://127.0.0.1:8001）
+# AGENT_SERVER.url 应为 http://127.0.0.1:8000（保持绝对路径）
+```
 
 ---
 

@@ -589,6 +589,161 @@ PYEOF
 sudo docker cp /tmp/patch_per_conv_workspace.py openhands-app:/tmp/patch_per_conv_workspace.py
 sudo docker exec openhands-app python3 /tmp/patch_per_conv_workspace.py
 
+# ─── 补丁9：sandbox port proxy（Code/App tab 浏览器访问）───
+# VSCode (8001), App 预览 (8011/8012) 的 URL 是 http://127.0.0.1:{port}，
+# 浏览器无法通过 klogin 访问。在 openhands-app 注入 /api/sandbox-port/{port}/* 代理路由。
+cat > /tmp/patch_sandbox_port_proxy.py << 'PYEOF'
+"""Patch 9: Add /api/sandbox-port/{port}/{path} reverse proxy for VSCode/App tabs."""
+path = '/app/openhands/server/app.py'
+with open(path) as f:
+    src = f.read()
+
+if 'sandbox-port' in src:
+    print('sandbox-port 代理路由已存在 ✓')
+    exit(0)
+
+MARKER = 'app.include_router(agent_proxy_router)'
+if MARKER not in src:
+    print('WARNING: include_router(agent_proxy_router) not found in app.py')
+    exit(1)
+
+PROXY_ROUTES = '''
+
+# --- Sandbox port proxy: VSCode (8001), App (8011/8012) ---
+from fastapi import WebSocket as _FastAPIWebSocket
+@app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
+async def sandbox_port_proxy(port: int, path: str, request: Request):
+    """Reverse proxy any sandbox port through openhands-app (port 3000)."""
+    import httpx as _hx
+    target = f"http://127.0.0.1:{port}/{path}"
+    qs = str(request.query_params)
+    if qs:
+        target += f"?{qs}"
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
+    body = await request.body()
+    try:
+        async with _hx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            resp = await client.request(
+                method=request.method, url=target, headers=headers, content=body)
+            resp_headers = {k: v for k, v in resp.headers.items()
+                           if k.lower() not in ("content-encoding", "transfer-encoding", "connection")}
+            from starlette.responses import Response as _Resp
+            return _Resp(content=resp.content, status_code=resp.status_code,
+                        headers=resp_headers, media_type=resp.headers.get("content-type"))
+    except Exception as e:
+        from starlette.responses import Response as _Resp
+        return _Resp(content=str(e), status_code=502)
+
+@app.api_route("/api/sandbox-port/{port}/", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
+async def sandbox_port_proxy_root(port: int, request: Request):
+    """Root path variant for sandbox port proxy."""
+    return await sandbox_port_proxy(port, "", request)
+
+@app.websocket("/api/sandbox-port/{port}/{path:path}")
+async def sandbox_port_ws_proxy(port: int, path: str, websocket: _FastAPIWebSocket):
+    """WebSocket proxy for sandbox ports (VSCode needs WS for language server)."""
+    import websockets as _ws
+    await websocket.accept()
+    qs = str(websocket.query_params)
+    ws_url = f"ws://127.0.0.1:{port}/{path}"
+    if qs:
+        ws_url += f"?{qs}"
+    try:
+        async with _ws.connect(ws_url) as target_ws:
+            import asyncio
+            async def client_to_target():
+                try:
+                    while True:
+                        data = await websocket.receive()
+                        if "text" in data:
+                            await target_ws.send(data["text"])
+                        elif "bytes" in data and data["bytes"]:
+                            await target_ws.send(data["bytes"])
+                except Exception:
+                    pass
+            async def target_to_client():
+                try:
+                    async for msg in target_ws:
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
+                except Exception:
+                    pass
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(client_to_target()),
+                 asyncio.create_task(target_to_client())],
+                return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+    except Exception:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+# --- End sandbox port proxy ---
+'''
+
+src = src.replace(MARKER, MARKER + PROXY_ROUTES, 1)
+with open(path, 'w') as f:
+    f.write(src)
+print('sandbox-port 代理路由已注入 ✓')
+PYEOF
+sudo docker cp /tmp/patch_sandbox_port_proxy.py openhands-app:/tmp/patch_sandbox_port_proxy.py
+sudo docker exec openhands-app python3 /tmp/patch_sandbox_port_proxy.py
+
+# ─── 补丁10：exposed_urls 代理路径重写（VSCODE/WORKER → /api/sandbox-port/）───
+# _container_to_sandbox_info() 返回的 exposed_urls 中 VSCODE/WORKER 是 http://127.0.0.1:{port}，
+# 改写为 /api/sandbox-port/{port}。AGENT_SERVER 保持绝对 URL（health check 需要）。
+cat > /tmp/patch_sandbox_exposed_urls.py << 'PYEOF'
+"""Patch 10: Rewrite VSCODE/WORKER exposed_urls to use /api/sandbox-port/{port} proxy path.
+AGENT_SERVER URL must remain absolute (used internally for health checks)."""
+path = '/app/openhands/app_server/sandbox/docker_sandbox_service.py'
+with open(path) as f:
+    src = f.read()
+
+if '/api/sandbox-port/' in src:
+    print('exposed_urls 代理路径补丁已存在 ✓')
+    exit(0)
+
+old_return = '''        return SandboxInfo(
+            id=container.name,
+            created_by_user_id=None,
+            sandbox_spec_id=container.image.tags[0],
+            status=status,
+            session_api_key=session_api_key,
+            exposed_urls=exposed_urls,'''
+
+new_return = '''        # Rewrite VSCODE/WORKER URLs to use proxy (AGENT_SERVER stays absolute for health checks)
+        if exposed_urls:
+            for _eu in exposed_urls:
+                if _eu.name != 'AGENT_SERVER':
+                    import re as _re
+                    _eu.url = _re.sub(r'https?://[^/]+', f'/api/sandbox-port/{_eu.port}', _eu.url, count=1)
+
+        return SandboxInfo(
+            id=container.name,
+            created_by_user_id=None,
+            sandbox_spec_id=container.image.tags[0],
+            status=status,
+            session_api_key=session_api_key,
+            exposed_urls=exposed_urls,'''
+
+if old_return not in src:
+    print('WARNING: return SandboxInfo pattern 未匹配')
+    exit(1)
+
+src = src.replace(old_return, new_return, 1)
+with open(path, 'w') as f:
+    f.write(src)
+print('exposed_urls 代理路径补丁已应用（保留 AGENT_SERVER 不变）✓')
+PYEOF
+sudo docker cp /tmp/patch_sandbox_exposed_urls.py openhands-app:/tmp/patch_sandbox_exposed_urls.py
+sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
+
 # ─── 重启 openhands-app 使所有 Python 补丁生效 ───
 echo ""
 echo ">>> 重启 openhands-app 使补丁生效..."
@@ -613,6 +768,8 @@ sudo docker exec openhands-app python3 /tmp/patch_v1svc.py
 sudo docker exec openhands-app python3 /tmp/patch_sre.py
 sudo docker exec openhands-app python3 /tmp/patch_api_proxy_events.py
 sudo docker exec openhands-app python3 /tmp/patch_per_conv_workspace.py
+sudo docker exec openhands-app python3 /tmp/patch_sandbox_port_proxy.py
+sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
 # 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发）
 sudo docker cp openhands-app:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
@@ -649,6 +806,12 @@ fi
 echo "测试代理路由..."
 PROXY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3001/agent-server-proxy/health)
 [ "$PROXY_CODE" = "200" ] && echo "agent-server 代理路由 ✓" || echo "警告: 代理路由返回 $PROXY_CODE"
+
+echo "测试 sandbox port proxy（Code/App tab）..."
+SPORT_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3001/api/sandbox-port/8001/")
+[ "$SPORT_CODE" = "200" ] || [ "$SPORT_CODE" = "302" ] || [ "$SPORT_CODE" = "403" ] && \
+  echo "sandbox port proxy 路由 ✓（HTTP $SPORT_CODE）" || \
+  echo "警告: sandbox port proxy 返回 $SPORT_CODE（正常情况需等 sandbox 启动后才能访问）"
 
 echo "测试新建 V1 会话（浏览器路径）..."
 CONV_V1_RESP=$(curl -s -X POST http://localhost:3001/api/v1/app-conversations \
@@ -707,6 +870,8 @@ echo "  - socket.io polling 回退（V0 会话）"
 echo "  - /api/proxy/events SSE 路由（klogin 可转发，修复 V1 Disconnected）"
 echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
+echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问）"
+echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
 echo ""
 echo "访问方式："
 echo "  域名（推荐）: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com"
