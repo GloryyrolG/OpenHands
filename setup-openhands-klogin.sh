@@ -442,63 +442,33 @@ PYEOF
 sudo docker cp /tmp/patch_v1svc.py openhands-app:/tmp/patch_v1svc.py
 sudo docker exec openhands-app python3 /tmp/patch_v1svc.py
 
-# ─── 补丁5：should-render-event.js WebSocket → SSE EventSource ───
-# Je() hook 中把 new WebSocket(L) 替换为 EventSource（SSE），
-# SSE 是普通 HTTP 请求，klogin 不拦，即可解决 V1 会话 Disconnected 问题
+# ─── 补丁5：should-render-event.js（已废弃，由 index.html FakeWS 全局 override window.WebSocket）───
+# index.html 的 patch 7 已全局覆盖 window.WebSocket，should-render-event.js 内的 new WebSocket(L)
+# 会自动被 FakeWS 拦截，无需再修改 BMHP.js 文件。
+# 原来此处注入 EventSource 代码会产生有效或无效正则，对浏览器 immutable cache 造成污染，已移除。
+# 保留原版 BMHP.js（有效 JS）以避免 "Invalid regular expression flags" SyntaxError。
 cat > /tmp/patch_sre.py << 'PYEOF'
-path = '/app/frontend/build/assets/should-render-event-D7h-BMHP.js'
-with open(path) as f:
+import os, shutil
+
+ASSETS = '/app/frontend/build/assets'
+bmhp = os.path.join(ASSETS, 'should-render-event-D7h-BMHP.js')
+bmhpx = os.path.join(ASSETS, 'should-render-event-D7h-BMHPx.js')
+
+with open(bmhp) as f:
     src = f.read()
 
 if 'EventSource' in src:
-    print('should-render-event.js SSE 补丁已存在 ✓')
-    exit(0)
-
-B = chr(92)  # backslash, avoids Python escape confusion
-old_ws = 'const O=new WebSocket(L);'
-new_ws = (
-    # Extract conversation_id and session_api_key from the WS URL
-    'const _m=L.match(/' + B + '/sockets' + B + '/events' + B + '/([^?]+)(?:' + B + '?(.*))?/);'
-    'const _id=_m?_m[1]:"";'
-    'const _key=(new URLSearchParams(_m&&_m[2]?_m[2]:"")).get("session_api_key")||"";'
-    # Build SSE URL: ws://host/agent-server-proxy/sockets/events/{id}?... → http://host/.../sse?...
-    'const _su=L.replace(/^ws:/,"http:").replace(/^wss:/,"https:")'
-    '.replace(/(' + B + '/sockets' + B + '/events' + B + '/[^?]+)/,"$1/sse");'
-    # Fake WebSocket object backed by EventSource
-    'const O={'
-    'readyState:0,onopen:null,onmessage:null,onclose:null,onerror:null,_es:null,'
-    'send:function(d){'
-    'fetch("/agent-server-proxy/api/conversations/"+_id+"/events",'
-    '{method:"POST",headers:{"Content-Type":"application/json","X-Session-API-Key":_key},body:d})'
-    '.catch(function(){});'
-    '},'
-    'close:function(){'
-    'if(O._es){O._es.close();O._es=null;}'
-    'O.readyState=3;'
-    'if(O.onclose)O.onclose({code:1000,reason:"",wasClean:true});'
-    '}'
-    '};'
-    'const _es=new EventSource(_su);O._es=_es;'
-    '_es.addEventListener("open",function(){O.readyState=1;if(O.onopen)O.onopen({})});'
-    '_es.addEventListener("message",function(ev){'
-    'if(ev.data==="__connected__")return;'
-    'if(ev.data==="__closed__"){O.readyState=3;if(O.onclose)O.onclose({code:1000,wasClean:true});return;}'
-    'if(O.onmessage)O.onmessage({data:ev.data});'
-    '});'
-    '_es.addEventListener("error",function(){'
-    'if(O._es){O._es.close();O._es=null;}'
-    'O.readyState=3;if(O.onerror)O.onerror({});'
-    'if(O.onclose)O.onclose({code:1006,reason:"",wasClean:false});'
-    '});'
-)
-
-if old_ws in src:
-    src = src.replace(old_ws, new_ws, 1)
-    with open(path, 'w') as f:
-        f.write(src)
-    print('should-render-event.js SSE 补丁已应用 ✓')
+    # 旧版有 EventSource 注入（可能有 broken regex），还原为原版不可行
+    # 这里只打印警告，patch 5b 会处理 BMHPx 的 cache-bust
+    print('WARNING: BMHP.js has EventSource injection - should be restored to original')
 else:
-    print('WARNING: WebSocket pattern not found in should-render-event.js')
+    print('should-render-event.js 已是原版（无 FakeWS 注入）✓')
+    # 确保 BMHPx.js 也是原版
+    if not os.path.exists(bmhpx) or open(bmhpx).read() != src:
+        shutil.copy2(bmhp, bmhpx)
+        print('BMHPx.js 已同步为原版 ✓')
+    else:
+        print('BMHPx.js 已是原版 ✓')
 PYEOF
 sudo docker cp /tmp/patch_sre.py openhands-app:/tmp/patch_sre.py
 sudo docker exec openhands-app python3 /tmp/patch_sre.py
