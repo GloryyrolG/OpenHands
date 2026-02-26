@@ -806,8 +806,16 @@ PROXY_ROUTES = '''
 from fastapi import WebSocket as _FastAPIWebSocket
 @app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
 async def sandbox_port_proxy(port: int, path: str, request: Request):
-    """Reverse proxy any sandbox port through openhands-app (port 3000)."""
-    import httpx as _hx
+    """Reverse proxy any sandbox port through openhands-app (port 3000).
+    VSCode (port 8001) flow:
+      1. GET /?tkn=TOKEN  -> VSCode returns 302 + Set-Cookie + Location:/
+         We rewrite Location: / -> Location: /api/sandbox-port/{port}/
+         so browser redirect stays within proxy.
+      2. Browser follows redirect with cookie -> GET /api/sandbox-port/{port}/
+         We serve VSCode HTML with all absolute paths rewritten to proxy-relative.
+      3. Browser loads workbench.js etc via /api/sandbox-port/{port}/stable-.../
+    """
+    import httpx as _hx, re as _re
     target = f"http://127.0.0.1:{port}/{path}"
     qs = str(request.query_params)
     if qs:
@@ -815,15 +823,62 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
     body = await request.body()
+    proxy_base = f"/api/sandbox-port/{port}"
     try:
-        async with _hx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        async with _hx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
             resp = await client.request(
                 method=request.method, url=target, headers=headers, content=body)
-            resp_headers = {k: v for k, v in resp.headers.items()
-                           if k.lower() not in ("content-encoding", "transfer-encoding", "connection")}
+            resp_headers = {}
+            for k, v in resp.headers.multi_items():
+                if k.lower() in ("content-encoding", "transfer-encoding", "connection"):
+                    continue
+                # Rewrite Location so browser redirect stays within proxy
+                if k.lower() == "location":
+                    if v.startswith("http://127.0.0.1") or v.startswith("http://localhost"):
+                        v = _re.sub(r"https?://[^/]+", proxy_base, v, count=1)
+                    elif v.startswith("/") and not v.startswith(proxy_base):
+                        v = proxy_base + v
+                resp_headers[k] = v
+            content = resp.content
+            ct = resp.headers.get("content-type", "")
+            # Rewrite HTML responses: fix absolute paths so they route through proxy
+            if "text/html" in ct and content:
+                try:
+                    html = content.decode("utf-8")
+                    # Rewrite absolute href/src to go through proxy
+                    def _rewrite_abs(m):
+                        attr, url = m.group(1), m.group(2)
+                        if url.startswith(proxy_base):
+                            return m.group(0)
+                        return attr + proxy_base + url
+                    html = _re.sub(
+                        r'((?:src|href|action)=["\'])(/[^/"\'#][^"\']*)',
+                        _rewrite_abs,
+                        html
+                    )
+                    # Fix serverBasePath in workbench config (HTML-encoded JSON)
+                    html = html.replace(
+                        "&quot;serverBasePath&quot;:&quot;/&quot;",
+                        "&quot;serverBasePath&quot;:&quot;" + proxy_base + "/&quot;"
+                    )
+                    # Fix inline baseUrl script
+                    html = _re.sub(
+                        r"(new URL\(')(/stable-[^']+)(')",
+                        lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3),
+                        html
+                    )
+                    # Clear remoteAuthority so VSCode uses same-origin WebSocket
+                    html = _re.sub(
+                        r"&quot;remoteAuthority&quot;:&quot;127[^&]*&quot;",
+                        "&quot;remoteAuthority&quot;:&quot;&quot;",
+                        html
+                    )
+                    content = html.encode("utf-8")
+                except Exception:
+                    pass
             from starlette.responses import Response as _Resp
-            return _Resp(content=resp.content, status_code=resp.status_code,
-                        headers=resp_headers, media_type=resp.headers.get("content-type"))
+            return _Resp(content=content, status_code=resp.status_code,
+                        headers=resp_headers, media_type=ct or resp.headers.get("content-type"))
     except Exception as e:
         from starlette.responses import Response as _Resp
         return _Resp(content=str(e), status_code=502)
