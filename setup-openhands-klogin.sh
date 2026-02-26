@@ -9,7 +9,7 @@ echo ">>> 获取 klogin 实例列表..."
 klogin instances list
 
 echo ""
-read -p "请输入你的 instance-id（如 rongyu-chen-test1）: " INSTANCE_ID
+read -p "请输入你的 instance-id（如 your-name-test1）: " INSTANCE_ID
 
 # 2. 检查实例状态
 STATUS=$(klogin instances list -o json 2>/dev/null | python3 -c "
