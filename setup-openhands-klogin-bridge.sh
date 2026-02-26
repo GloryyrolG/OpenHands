@@ -144,7 +144,8 @@ sudo docker run -d --pull=always \
   -e ENABLE_MCP=false \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v ~/.openhands-bridge:/.openhands \
-  docker.openhands.dev/openhands/openhands:1.3
+  docker.openhands.dev/openhands/openhands:1.3 \
+  uvicorn openhands.server.listen:app --host 0.0.0.0 --port 3002
 
 echo "等待启动..."
 for i in $(seq 1 30); do
