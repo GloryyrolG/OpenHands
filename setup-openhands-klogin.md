@@ -45,6 +45,7 @@ bash setup-openhands-klogin.sh
 | 6 | /api/proxy/events 路由 | `app.py` | klogin 只转发 /api/*，SSE 事件流走此路径 |
 | 7 | index.html FakeWS | `index.html` | 全局 WS 拦截→SSE，绕过 klogin 缓存 |
 | 8 | per-conversation workspace | `live_status_app_conversation_service.py` | 每会话独立工作目录 |
+| 2b | rate limiter 修复 | `middleware.py` | klogin 共享 IP + SSE 重连风暴导致全局 429；SSE 排除限流 + X-Forwarded-For |
 | 9 | sandbox port proxy | `app.py` | 注入 `/api/sandbox-port/{port}/*` 反代，让浏览器访问 VSCode/App tab |
 | 10 | exposed_urls 重写 | `docker_sandbox_service.py` | VSCODE/WORKER URL 改为 `/api/sandbox-port/{port}`；AGENT_SERVER 保持绝对 URL |
 

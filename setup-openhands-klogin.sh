@@ -270,6 +270,61 @@ sudo docker cp /tmp/agent_server_proxy.py openhands-app:/app/openhands/server/ro
 sudo docker cp /tmp/patch_app.py openhands-app:/tmp/patch_app.py
 sudo docker exec openhands-app python3 /tmp/patch_app.py
 
+# ─── 补丁2b：rate limiter 修复（klogin 共享 IP + SSE 重连风暴）───
+# 根因1：klogin 所有请求共用同一代理 IP，per-IP 10req/s 限流会误杀正常请求。
+# 根因2：老 browser tab 的 SSE 失败后不断重连，把限流配额耗尽。
+# 修复：SSE 端点排除限流 + 用 X-Forwarded-For 获取真实客户端 IP。
+cat > /tmp/patch_rate_limiter.py << 'PYEOF'
+with open('/app/openhands/server/middleware.py') as f:
+    src = f.read()
+
+old_check = (
+    "    def is_rate_limited_request(self, request: StarletteRequest) -> bool:\n"
+    "        if request.url.path.startswith('/assets'):\n"
+    "            return False\n"
+    "        # Put Other non rate limited checks here\n"
+    "        return True\n"
+)
+new_check = (
+    "    def is_rate_limited_request(self, request: StarletteRequest) -> bool:\n"
+    "        path = request.url.path\n"
+    "        if path.startswith('/assets'):\n"
+    "            return False\n"
+    "        # SSE/streaming: long-lived connections, not rapid requests, skip rate limit\n"
+    "        if '/sockets/events/' in path and path.endswith('/sse'):\n"
+    "            return False\n"
+    "        if '/api/proxy/events/' in path and path.endswith('/stream'):\n"
+    "            return False\n"
+    "        return True\n"
+)
+old_key = "        key = request.client.host\n"
+new_key = (
+    "        # klogin proxies all traffic through a single IP; use X-Forwarded-For for real client\n"
+    "        key = request.headers.get('x-forwarded-for', '').split(',')[0].strip() or request.client.host\n"
+)
+
+if 'sockets/events' in src and '/sse' in src and 'return False' in src[src.find('sockets/events'):]:
+    print('rate limiter SSE 排除已存在 ✓')
+elif old_check in src:
+    src = src.replace(old_check, new_check, 1)
+    print('SSE 路径排除限流 ✓')
+else:
+    print('WARNING: is_rate_limited_request pattern 未匹配，跳过')
+
+if 'x-forwarded-for' in src:
+    print('X-Forwarded-For key 已存在 ✓')
+elif old_key in src:
+    src = src.replace(old_key, new_key, 1)
+    print('X-Forwarded-For key 修复 ✓')
+else:
+    print('WARNING: key pattern 未匹配，跳过')
+
+with open('/app/openhands/server/middleware.py', 'w') as f:
+    f.write(src)
+PYEOF
+sudo docker cp /tmp/patch_rate_limiter.py openhands-app:/tmp/patch_rate_limiter.py
+sudo docker exec openhands-app python3 /tmp/patch_rate_limiter.py
+
 # ─── 补丁3：socket.io polling（修复 V0 会话 Disconnected）───
 # klogin 会剥离 WebSocket Upgrade 头，改为 polling+websocket 顺序，先用 polling
 for JS_ASSET in markdown-renderer-Ci-ahARR.js parse-pr-url-BOXiVwNz.js; do
@@ -770,6 +825,7 @@ sudo docker exec openhands-app python3 /tmp/patch_api_proxy_events.py
 sudo docker exec openhands-app python3 /tmp/patch_per_conv_workspace.py
 sudo docker exec openhands-app python3 /tmp/patch_sandbox_port_proxy.py
 sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
+sudo docker exec openhands-app python3 /tmp/patch_rate_limiter.py
 # 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发）
 sudo docker cp openhands-app:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
@@ -870,6 +926,7 @@ echo "  - socket.io polling 回退（V0 会话）"
 echo "  - /api/proxy/events SSE 路由（klogin 可转发，修复 V1 Disconnected）"
 echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
+echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
 echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问）"
 echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
 echo ""
