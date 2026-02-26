@@ -2,22 +2,62 @@
 
 > 全程不需要克隆任何代码，只需要 klogin 账号和 Docker。
 
-## 前置条件
-
-本地 Mac 安装 klogin 客户端：
-```bash
-brew install klogin
-```
-
 ## 一键部署
 
 ```bash
 bash setup-openhands-klogin.sh
 ```
 
-脚本会自动完成下面所有步骤，包括打补丁让域名访问正常工作。
+脚本会自动完成所有步骤：启动 OpenHands、打全部补丁、建立 SSH 隧道、验证连通性。
 
 ---
+
+## 架构概述
+
+```
+浏览器 → klogin ingress (剥离 WS Upgrade) → openhands-app (Python, port 3000)
+                                                  ├── /api/*           → V0/V1 API
+                                                  ├── /agent-server-proxy/* → 反向代理到 agent-server
+                                                  └── /api/proxy/*     → SSE/WS 事件路由
+                                                          ↓
+                                              agent-server (Go binary, port 8000)
+                                                          ↓
+                                              sandbox 容器 (tmux session)
+                                                          ↓
+                                    /workspace/project/{conv_id}/  ← 每会话隔离
+```
+
+## 补丁清单
+
+脚本自动应用以下补丁（全部在容器 writable layer，`docker restart` 保留，`docker rm -f` 后需重跑脚本）：
+
+| # | 补丁 | 修改文件 | 解决问题 |
+|---|------|----------|----------|
+| 1 | sandbox 复用 | `docker_sandbox_service.py` | host network 下多 sandbox 争端口 8000 → 401 |
+| 2 | agent-server 反向代理 | `agent_server_proxy.py` + `app.py` | 浏览器无法直接访问 127.0.0.1:8000 |
+| 3 | socket.io polling | `markdown-renderer-*.js`, `parse-pr-url-*.js` | V0 会话 Disconnected |
+| 4 | v1-svc.js 路由重写 | `v1-conversation-service.api-*.js` | V1 API 调用走反向代理 |
+| 5 | should-render-event SSE | `should-render-event-*.js` | V1 WebSocket→EventSource |
+| 6 | /api/proxy/events 路由 | `app.py` | klogin 只转发 /api/*，SSE 事件流走此路径 |
+| 7 | index.html FakeWS | `index.html` | 全局 WS 拦截→SSE，绕过 klogin 缓存 |
+| 8 | per-conversation workspace | `live_status_app_conversation_service.py` | 每会话独立工作目录 |
+
+### 补丁8 详细说明：Per-Conversation 工作目录隔离
+
+**问题**：sandbox 复用（补丁1）后所有 V1 会话共用 `/workspace/project/`，新会话能看到旧会话文件。
+
+**方案**：在 `_start_app_conversation()` 中，为每个会话创建 `/workspace/project/{task.id.hex}/` 子目录并 git init。后续 `remote_workspace` 和 `start_conversation_request` 均使用此子目录。
+
+**效果**：软隔离——每个会话默认在自己目录工作，技术上仍可 `cd ..` 看到其他会话（同一 Linux 用户）。
+
+---
+
+## 前置条件
+
+本地 Mac 安装 klogin 客户端：
+```bash
+brew install klogin
+```
 
 ## 手动步骤说明
 
@@ -53,7 +93,7 @@ echo "$EXTERNAL_IP host.docker.internal" | sudo tee -a /etc/hosts
 
 ### 4. 启动 OpenHands
 
-> ⚠️ 不要设置 `OH_SECRET_KEY`，否则 agent-server 认证会 401。
+> 不要设置 `OH_SECRET_KEY`，否则 agent-server 认证会 401。
 
 ```bash
 sudo docker ps -a --filter name=oh-agent-server -q | xargs -r sudo docker rm -f 2>/dev/null || true
@@ -77,21 +117,7 @@ sudo docker run -d --pull=always \
   docker.openhands.dev/openhands/openhands:1.3
 ```
 
-### 5. 打前端补丁（域名访问必须）
-
-klogin ingress 会剥离 WebSocket 升级头，不打补丁则域名访问时会话显示 Disconnected。
-
-```bash
-JS_FILE=/tmp/oh-md-patch.js
-sudo docker cp openhands-app:/app/frontend/build/assets/markdown-renderer-Ci-ahARR.js $JS_FILE
-sudo chmod 644 $JS_FILE
-sudo sed -i 's/transports:\["websocket"\]/transports:["polling","websocket"]/g' $JS_FILE
-sudo docker cp $JS_FILE openhands-app:/app/frontend/build/assets/markdown-renderer-Ci-ahARR.js
-```
-
-> 此补丁在容器内，`docker restart` 不影响，`docker rm -f` 重建后需重打（脚本已自动处理）。
-
-### 6. 配置 LLM
+### 5. 配置 LLM
 
 编辑 `~/.openhands/settings.json`（klogin 实例上）：
 ```json
@@ -102,7 +128,7 @@ sudo docker cp $JS_FILE openhands-app:/app/frontend/build/assets/markdown-render
 }
 ```
 
-> model proxy (dify-model-proxy) 已部署在 klogin 本地 8881 端口，无需任何隧道转发。
+> model proxy (dify-model-proxy) 需以 `--network host` 部署在 klogin 本地 8881 端口。
 
 ---
 
@@ -119,7 +145,6 @@ https://openhands.svc.<instance-id>.klogin-user.mlplatform.apple.com
 ### SSH 本地隧道
 
 ```bash
-# 只需端口转发，不需要 -R 反向隧道
 ssh -f -N -L 3001:127.0.0.1:3000 <instance-id>
 # 然后访问 http://localhost:3001
 ```
@@ -130,21 +155,37 @@ ssh -f -N -L 3001:127.0.0.1:3000 <instance-id>
 
 ### 会话显示 Disconnected
 
-未打前端补丁，或容器重建后补丁丢失。执行步骤 5 重新打补丁即可。
+未打前端补丁，或容器 `docker rm -f` 重建后补丁丢失。重新运行 `setup-openhands-klogin.sh` 即可。
 
 ### 401 Unauthorized
 
-重启时未清理旧 agent-server：
 ```bash
+# 清理旧 agent-server 容器
 sudo docker ps -a --filter name=oh-agent-server -q | xargs -r sudo docker rm -f
-sudo docker restart openhands-app
-# 重启后重新执行步骤 5 打补丁
+sudo docker rm -f openhands-app
+# 用上面正确命令重新启动（不加 OH_SECRET_KEY）
 ```
 
-确认启动命令**没有** `OH_SECRET_KEY`。
+### V1 会话消息无响应
+
+HTTP POST 到 agent-server 不唤醒 Python agent asyncio 队列。补丁2/6/7 通过 WebSocket 转发解决此问题。如果仍有问题，检查 agent-server 是否在运行：
+```bash
+sudo docker ps --filter name=oh-agent-server
+```
 
 ### 查看日志
 
 ```bash
 sudo docker logs openhands-app --tail 50
+# agent-server 日志
+AGENT=$(sudo docker ps --filter name=oh-agent-server -q | head -1)
+sudo docker logs $AGENT --tail 50
+```
+
+### 验证 per-conversation 目录隔离
+
+```bash
+AGENT=$(sudo docker ps --filter name=oh-agent-server -q | head -1)
+sudo docker exec $AGENT ls /workspace/project/
+# 应看到多个 UUID 子目录，每个对应一个会话
 ```
