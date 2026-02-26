@@ -391,7 +391,7 @@ cat > /tmp/patch_api_proxy_events.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if '/api/proxy/events' in src and 'Must send via WebSocket' in src:
+if '/api/proxy/events' in src and 'Must send via WebSocket' in src and '_AGENT_WS' not in src:
     print('api/proxy/events 路由（含WebSocket修复）已存在 ✓')
     exit(0)
 
@@ -408,7 +408,7 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     from starlette.responses import StreamingResponse as _SR
     params = dict(request.query_params)
     qs = "&".join(f"{k}={v}" for k, v in params.items())
-    ws_url = f"{_AGENT_WS}/sockets/events/{conversation_id}"
+    ws_url = f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
     if qs:
         ws_url += f"?{qs}"
     async def _gen():
