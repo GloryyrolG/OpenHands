@@ -132,6 +132,10 @@ echo "$SANDBOX_RESULT"
 
 cat > /tmp/agent_server_proxy.py << 'PYEOF'
 import asyncio
+import functools as _ft
+import json as _json_mod
+import socket as _socket_mod
+import http.client as _http_client
 import httpx
 import websockets
 from fastapi import APIRouter, Request, WebSocket, Response
@@ -141,6 +145,39 @@ AGENT_SERVER_HTTP = "http://127.0.0.1:8000"
 AGENT_SERVER_WS = "ws://127.0.0.1:8000"
 
 agent_proxy_router = APIRouter(prefix="/agent-server-proxy")
+
+
+class _UnixHTTPConnection(_http_client.HTTPConnection):
+    def __init__(self, socket_path):
+        super().__init__("localhost")
+        self._socket_path = socket_path
+    def connect(self):
+        s = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+        s.connect(self._socket_path)
+        self.sock = s
+
+@_ft.lru_cache(maxsize=1)
+def _get_agent_server_key() -> str:
+    """Read session_api_key from oh-agent-server via Docker API (Unix socket)."""
+    try:
+        conn = _UnixHTTPConnection("/var/run/docker.sock")
+        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-agent-server%22%5D%7D")
+        resp = conn.getresponse()
+        containers = _json_mod.loads(resp.read())
+        if not containers:
+            return ""
+        cid = containers[0]["Id"]
+        conn2 = _UnixHTTPConnection("/var/run/docker.sock")
+        conn2.request("GET", f"/containers/{cid}/json")
+        resp2 = conn2.getresponse()
+        cdata = _json_mod.loads(resp2.read())
+        env_list = cdata.get("Config", {}).get("Env", [])
+        for e in env_list:
+            if e.startswith("OH_SESSION_API_KEYS_0="):
+                return e.split("=", 1)[1]
+        return ""
+    except Exception:
+        return ""
 
 
 # SSE 端点：将 agent-server WebSocket 转为 SSE（klogin 不拦截 HTTP，会拦截 WS Upgrade）
@@ -236,6 +273,11 @@ async def proxy_http(request: Request, path: str):
     params = dict(request.query_params)
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
+    # Auto-inject session_api_key if not present (Changes tab etc. don't send it)
+    if "x-session-api-key" not in {k.lower() for k in headers} and "session_api_key" not in params:
+        _key = _get_agent_server_key()
+        if _key:
+            headers["X-Session-API-Key"] = _key
     body = await request.body()
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
