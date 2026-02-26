@@ -325,6 +325,31 @@ PYEOF
 sudo docker cp /tmp/patch_rate_limiter.py openhands-app:/tmp/patch_rate_limiter.py
 sudo docker exec openhands-app python3 /tmp/patch_rate_limiter.py
 
+# ─── 补丁2c：CacheControlMiddleware 改为 no-cache（防止浏览器将 JS 资产缓存为 immutable）───
+# 根因：middleware.py 的 CacheControlMiddleware 对所有 /assets/*.js 设置 immutable(max-age=30d)，
+# 导致补丁修改的 JS 文件无法被浏览器重新获取，必须使用全新文件名才能绕过缓存。
+# 修复：改为 no-cache, must-revalidate，让浏览器每次都向服务器确认文件是否更新。
+cat > /tmp/patch_cache_control.py << 'PYEOF'
+with open('/app/openhands/server/middleware.py') as f:
+    src = f.read()
+
+if 'no-cache, must-revalidate' in src and 'immutable' not in src:
+    print('CacheControlMiddleware 已设置 no-cache ✓')
+else:
+    src = src.replace(
+        "'public, max-age=2592000, immutable'",
+        "'no-cache, must-revalidate'"
+    ).replace(
+        '"public, max-age=2592000, immutable"',
+        '"no-cache, must-revalidate"'
+    )
+    with open('/app/openhands/server/middleware.py', 'w') as f:
+        f.write(src)
+    print('CacheControlMiddleware: immutable → no-cache, must-revalidate ✓')
+PYEOF
+sudo docker cp /tmp/patch_cache_control.py openhands-app:/tmp/patch_cache_control.py
+sudo docker exec openhands-app python3 /tmp/patch_cache_control.py
+
 # ─── 补丁3：socket.io polling（修复 V0 会话 Disconnected）───
 # klogin 会剥离 WebSocket Upgrade 头，改为 polling+websocket 顺序，先用 polling
 for JS_ASSET in markdown-renderer-Ci-ahARR.js parse-pr-url-BOXiVwNz.js; do
@@ -396,7 +421,7 @@ new_ws = (
     'const _key=(new URLSearchParams(_m&&_m[2]?_m[2]:"")).get("session_api_key")||"";'
     # Build SSE URL: ws://host/agent-server-proxy/sockets/events/{id}?... → http://host/.../sse?...
     'const _su=L.replace(/^ws:/,"http:").replace(/^wss:/,"https:")'
-    '.replace(/(/' + B + '/sockets' + B + '/events' + B + '/[^?]+)/,"$1/sse");'
+    '.replace(/(' + B + '/sockets' + B + '/events' + B + '/[^?]+)/,"$1/sse");'
     # Fake WebSocket object backed by EventSource
     'const O={'
     'readyState:0,onopen:null,onmessage:null,onclose:null,onerror:null,_es:null,'
@@ -435,6 +460,119 @@ else:
 PYEOF
 sudo docker cp /tmp/patch_sre.py openhands-app:/tmp/patch_sre.py
 sudo docker exec openhands-app python3 /tmp/patch_sre.py
+
+# ─── 补丁5b：cache busting — 重命名已修改的 JS 文件（bust proxy/browser immutable cache）───
+# should-render-event → BMHPx, conversation-fHdubO7R → Rx, manifest → x, 更新 index.html
+cat > /tmp/patch_cache_bust.py << 'PYEOF'
+import os, shutil
+
+ASSETS = '/app/frontend/build/assets'
+INDEX  = '/app/frontend/build/index.html'
+
+def copy_if_missing(src, dst, label):
+    if os.path.exists(dst):
+        print(f'{label} already exists ✓')
+        return False
+    shutil.copy2(src, dst)
+    print(f'Copied {label}')
+    return True
+
+# Step 1: should-render-event-D7h-BMHP.js → BMHPx.js
+sre_old = os.path.join(ASSETS, 'should-render-event-D7h-BMHP.js')
+sre_new = os.path.join(ASSETS, 'should-render-event-D7h-BMHPx.js')
+copy_if_missing(sre_old, sre_new, 'should-render-event-D7h-BMHPx.js')
+
+# Step 2: update all files that reference old SRE name
+sre_refs = [
+    'conversation-uXvJtyCL.js', 'planner-tab-BB0IaNpo.js',
+    'served-tab-Ath35J_c.js', 'shared-conversation-ly3fwRqE.js',
+    'conversation-fHdubO7R.js', 'changes-tab-CXgkYeVu.js',
+    'vscode-tab-CFaq3Fn-.js', 'manifest-8c9a7105.js',
+]
+for fname in sre_refs:
+    p = os.path.join(ASSETS, fname)
+    if not os.path.exists(p):
+        continue
+    with open(p) as f:
+        src = f.read()
+    if 'should-render-event-D7h-BMHP.js' in src and 'BMHPx' not in src:
+        src = src.replace('should-render-event-D7h-BMHP.js', 'should-render-event-D7h-BMHPx.js')
+        with open(p, 'w') as f:
+            f.write(src)
+        print(f'Updated SRE ref in {fname}')
+
+# Step 3: conversation-fHdubO7R.js → Rx
+conv_old = os.path.join(ASSETS, 'conversation-fHdubO7R.js')
+conv_new = os.path.join(ASSETS, 'conversation-fHdubO7Rx.js')
+copy_if_missing(conv_old, conv_new, 'conversation-fHdubO7Rx.js')
+
+# Step 4: update manifest to reference new conversation file
+mf = os.path.join(ASSETS, 'manifest-8c9a7105.js')
+if os.path.exists(mf):
+    with open(mf) as f:
+        src = f.read()
+    if 'conversation-fHdubO7R.js' in src:
+        src = src.replace('conversation-fHdubO7R.js', 'conversation-fHdubO7Rx.js')
+        with open(mf, 'w') as f:
+            f.write(src)
+        print('Updated conversation ref in manifest-8c9a7105.js')
+
+# Step 5: manifest-8c9a7105.js → x
+mf_new = os.path.join(ASSETS, 'manifest-8c9a7105x.js')
+copy_if_missing(mf, mf_new, 'manifest-8c9a7105x.js')
+
+# Step 6: update index.html to reference new manifest
+with open(INDEX) as f:
+    idx = f.read()
+if 'manifest-8c9a7105.js' in idx:
+    idx = idx.replace('manifest-8c9a7105.js', 'manifest-8c9a7105x.js')
+    with open(INDEX, 'w') as f:
+        f.write(idx)
+    print('Updated manifest ref in index.html')
+elif 'manifest-8c9a7105x.js' in idx:
+    print('index.html already references manifest-8c9a7105x.js ✓')
+else:
+    print('WARNING: manifest not found in index.html')
+
+# Step 7: z-suffix round — 为可能已被浏览器缓存为 immutable 的 x-suffix 文件创建全新 URL
+# conversation-fHdubO7Rx.js → Rz.js（新 URL，浏览器从未见过，必然从服务器获取）
+# manifest-8c9a7105x.js → z.js（引用 Rz，更新 index.html 指向 z）
+# 根因：第一次部署时 immutable 头已生效，x 文件被浏览器缓存了旧内容；z 文件绕过此缓存。
+conv_rx = os.path.join(ASSETS, 'conversation-fHdubO7Rx.js')
+conv_rz = os.path.join(ASSETS, 'conversation-fHdubO7Rz.js')
+mf_x = os.path.join(ASSETS, 'manifest-8c9a7105x.js')
+mf_z = os.path.join(ASSETS, 'manifest-8c9a7105z.js')
+
+if os.path.exists(conv_rx):
+    shutil.copy2(conv_rx, conv_rz)
+    print(f'Created conversation-fHdubO7Rz.js ✓')
+else:
+    print('WARNING: conversation-fHdubO7Rx.js not found, skipping z-rename')
+
+if os.path.exists(mf_x):
+    with open(mf_x) as f:
+        mf_src = f.read()
+    mf_src = mf_src.replace('conversation-fHdubO7Rx.js', 'conversation-fHdubO7Rz.js')
+    with open(mf_z, 'w') as f:
+        f.write(mf_src)
+    print(f'Created manifest-8c9a7105z.js (refs Rz) ✓')
+
+# Update index.html to reference manifest-z (supersedes manifest-x step above)
+with open(INDEX) as f:
+    idx = f.read()
+if 'manifest-8c9a7105z.js' in idx:
+    print('index.html already references manifest-z ✓')
+elif 'manifest-8c9a7105x.js' in idx or 'manifest-8c9a7105.js' in idx:
+    idx = idx.replace('manifest-8c9a7105x.js', 'manifest-8c9a7105z.js')
+    idx = idx.replace('manifest-8c9a7105.js', 'manifest-8c9a7105z.js')
+    with open(INDEX, 'w') as f:
+        f.write(idx)
+    print('Updated index.html: manifest → manifest-z ✓')
+
+print('cache busting 完成 ✓')
+PYEOF
+sudo docker cp /tmp/patch_cache_bust.py openhands-app:/tmp/patch_cache_bust.py
+sudo docker exec openhands-app python3 /tmp/patch_cache_bust.py
 
 # ─── 补丁6：app.py 注入 /api/proxy/events 路由（klogin 转发 /api/*）───
 # klogin 只转发 /api/* 和 /socket.io/*。
@@ -922,6 +1060,7 @@ echo "========================================"
 echo "✓ 部署完成！所有补丁已应用："
 echo "  - sandbox 复用（防 401）"
 echo "  - agent-server 反向代理（HTTP + SSE）"
+echo "  - CacheControlMiddleware: no-cache 替代 immutable（防浏览器永久缓存 JS 补丁）"
 echo "  - socket.io polling 回退（V0 会话）"
 echo "  - /api/proxy/events SSE 路由（klogin 可转发，修复 V1 Disconnected）"
 echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
@@ -929,6 +1068,9 @@ echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
 echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
 echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问）"
 echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
+echo "  - git-service.js poll 修复（V1 新建会话直接返回真实 conversation_id）"
+echo "  - task-nav-fix（index.html 兜底脚本，确保浏览器缓存情况下也能跳转会话）"
+echo "  - cache busting z-suffix（manifest/conversation JS 全新 URL，清除旧 immutable 缓存）"
 echo ""
 echo "访问方式："
 echo "  域名（推荐）: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com"
