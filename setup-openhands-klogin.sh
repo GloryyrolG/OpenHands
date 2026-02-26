@@ -300,7 +300,7 @@ new_check = (
 old_key = "        key = request.client.host\n"
 new_key = (
     "        # klogin proxies all traffic through a single IP; use X-Forwarded-For for real client\n"
-    "        key = request.headers.get('x-forwarded-for', '').split(',')[0].strip() or request.client.host\n"
+    "        key = request.headers.get('x-forwarded-for', '').split(',')[0].strip() or (request.client.host if request.client else '127.0.0.1')\n"
 )
 
 if 'sockets/events' in src and '/sse' in src and 'return False' in src[src.find('sockets/events'):]:
