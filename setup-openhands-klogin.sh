@@ -647,15 +647,27 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     if qs:
         ws_url += f"?{qs}"
     async def _gen():
-        try:
-            async with _ws.connect(ws_url) as ws:
-                yield "data: __connected__\\n\\n"
-                async for msg in ws:
-                    data = msg if isinstance(msg, str) else msg.decode()
-                    data = data.replace("\\n", "\\\\n")
-                    yield f"data: {data}\\n\\n"
-        except Exception:
-            pass
+        import asyncio as _asyncio
+        connected = False
+        _base_qs = "&".join(f"{k}={v}" for k, v in params.items() if k != "resend_all")
+        for attempt in range(30):  # retry up to 90s while conversation starts
+            try:
+                _url = ws_url if attempt == 0 else (
+                    f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
+                    + (f"?{_base_qs}" if _base_qs else "")
+                )
+                async with _ws.connect(_url) as ws:
+                    if not connected:
+                        yield "data: __connected__\\n\\n"
+                        connected = True
+                    async for msg in ws:
+                        data = msg if isinstance(msg, str) else msg.decode()
+                        data = data.replace("\\n", "\\\\n")
+                        yield f"data: {data}\\n\\n"
+                    return  # clean close
+            except Exception:
+                pass
+            await _asyncio.sleep(3)
         yield "data: __closed__\\n\\n"
     return _SR(_gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
