@@ -626,8 +626,8 @@ cat > /tmp/patch_api_proxy_events.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if '/api/proxy/events' in src and 'Must send via WebSocket' in src and '_AGENT_WS' not in src:
-    print('api/proxy/events 路由（含WebSocket修复）已存在 ✓')
+if '/api/proxy/events' in src and 'Must send via WebSocket' in src and '_AGENT_WS' not in src and 'heartbeat' in src:
+    print('api/proxy/events 路由（含WebSocket修复+heartbeat）已存在 ✓')
     exit(0)
 
 MARKER = 'app.include_router(agent_proxy_router)'
@@ -648,6 +648,7 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
         ws_url += f"?{qs}"
     async def _gen():
         import asyncio as _asyncio
+        yield ":heartbeat\\n\\n"  # flush headers immediately (prevents BaseHTTPMiddleware cancel)
         connected = False
         _base_qs = "&".join(f"{k}={v}" for k, v in params.items() if k != "resend_all")
         for attempt in range(30):  # retry up to 90s while conversation starts
