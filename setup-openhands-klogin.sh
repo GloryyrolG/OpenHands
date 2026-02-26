@@ -123,12 +123,11 @@ echo "$SANDBOX_RESULT"
 # ─── 补丁2：agent-server 反向代理路由（修复 V1 Disconnected + 消息无响应）───
 # 问题1：V1 会话的 agent-server URL 是 http://127.0.0.1:8000，浏览器无法直接访问。
 # 问题2：klogin ingress 剥离 WebSocket Upgrade 头，原生 WS 连接失败。
-# 问题3（核心）：POST /api/conversations/{id}/events 只存 DB，不唤醒 Python agent asyncio
-#               队列。必须通过 WebSocket 发送才能触发 agent 处理消息！
+# 问题3：浏览器发旧 OpenHands action 格式，agent-server v1.10.0-python 期望新 SDK 格式。
 # 修复：
 #   - 反向代理路由（HTTP/SSE/WS）让浏览器通过 klogin 访问 agent-server
 #   - SSE 端点替代 WebSocket（klogin 不拦截普通 HTTP）
-#   - POST /api/conversations/{id}/events 专用路由：收到 HTTP POST 后内部开 WS 转发
+#   - POST /api/conversations/{id}/events 专用路由：转换格式后 HTTP POST 给 agent-server
 
 cat > /tmp/agent_server_proxy.py << 'PYEOF'
 import asyncio
@@ -211,19 +210,44 @@ async def proxy_websocket(websocket: WebSocket, conversation_id: str):
             pass
 
 
-# POST events via WebSocket — HTTP POST到agent-server不唤醒Python agent asyncio队列
+# 将旧 OpenHands action 格式转换为 agent-server v1.10.0-python SDK SendMessageRequest 格式
+# 旧: {"action": "message", "args": {"content": "...", "image_urls": null}}
+# 新: {"role": "user", "content": [{"type": "text", "text": "..."}], "run": true}
+def _convert_action_to_sdk_message(body: bytes) -> bytes:
+    import json as _json
+    try:
+        data = _json.loads(body)
+        if data.get("action") == "message" and "args" in data:
+            content_str = data["args"].get("content", "")
+            image_urls = data["args"].get("image_urls") or []
+            content_items: list = [{"type": "text", "text": content_str}]
+            for url in image_urls:
+                content_items.append({"type": "image_url", "image_url": {"url": url}})
+            return _json.dumps({
+                "role": "user",
+                "content": content_items,
+                "run": True,
+            }).encode()
+    except Exception:
+        pass
+    return body
+
+
+# POST events: 将 browser 发来的旧 action 格式转换后发给 agent-server（HTTP POST）
 # 必须在 catch-all 之前注册
 @agent_proxy_router.post("/api/conversations/{conversation_id}/events")
 async def proxy_send_event_ws(conversation_id: str, request: Request):
     params = dict(request.query_params)
     key = request.headers.get("X-Session-API-Key", "") or params.get("session_api_key", "")
     body = await request.body()
-    ws_url = f"{AGENT_SERVER_WS}/sockets/events/{conversation_id}"
+    send_body = _convert_action_to_sdk_message(body)
+    url = f"{AGENT_SERVER_HTTP}/api/conversations/{conversation_id}/events"
+    headers: dict = {"Content-Type": "application/json"}
     if key:
-        ws_url += f"?session_api_key={key}"
+        headers["X-Session-API-Key"] = key
     try:
-        async with websockets.connect(ws_url) as ws:
-            await ws.send(body.decode())
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(url, content=send_body, headers=headers)
     except Exception:
         pass
     return Response(content='{"success":true}', status_code=200, media_type="application/json")
@@ -439,15 +463,15 @@ sudo docker exec openhands-app python3 /tmp/patch_sre.py
 # ─── 补丁6：app.py 注入 /api/proxy/events 路由（klogin 转发 /api/*）───
 # klogin 只转发 /api/* 和 /socket.io/*。
 # GET  /api/proxy/events/{id}/stream     — SSE 事件流（FakeWS EventSource 用）
-# POST /api/proxy/conversations/{id}/events — 收 HTTP POST 后内部走 WebSocket 发给 agent
-#   ↑ 关键！HTTP POST 直接发给 agent-server 不会唤醒 Python agent asyncio 队列，
-#     必须通过 WebSocket 发送才能触发 LLM 调用。
+# POST /api/proxy/conversations/{id}/events — 收 HTTP POST 后转换格式发给 agent-server
+#   agent-server v1.10.0-python 使用 SendMessageRequest 格式（role/content/run），
+#   浏览器仍发旧 OpenHands action 格式，需在此层转换。
 cat > /tmp/patch_api_proxy_events.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if '/api/proxy/events' in src and 'Must send via WebSocket' in src and '_AGENT_WS' not in src:
-    print('api/proxy/events 路由（含WebSocket修复）已存在 ✓')
+if '/api/proxy/events' in src and '_convert_action_to_sdk_message_app' in src:
+    print('api/proxy/events 路由（含格式转换）已存在 ✓')
     exit(0)
 
 MARKER = 'app.include_router(agent_proxy_router)'
@@ -480,19 +504,41 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     return _SR(_gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+def _convert_action_to_sdk_message_app(body: bytes) -> bytes:
+    """Convert old OpenHands action format to agent-server v1.10.0-python SendMessageRequest format."""
+    import json as _json
+    try:
+        data = _json.loads(body)
+        if data.get("action") == "message" and "args" in data:
+            content_str = data["args"].get("content", "")
+            image_urls = data["args"].get("image_urls") or []
+            content_items: list = [{"type": "text", "text": content_str}]
+            for url in image_urls:
+                content_items.append({"type": "image_url", "image_url": {"url": url}})
+            return _json.dumps({
+                "role": "user",
+                "content": content_items,
+                "run": True,
+            }).encode()
+    except Exception:
+        pass
+    return body
+
 @app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)
 async def api_proxy_send_event(conversation_id: str, request: Request):
-    # Must send via WebSocket to wake up Python agent's asyncio queue.
-    # HTTP POST only stores event in DB — agent won't see it.
-    import websockets as _ws
+    # Convert old OpenHands action format to SDK SendMessageRequest, then HTTP POST to agent-server.
+    # agent-server v1.10.0-python handles HTTP POST natively (no WebSocket needed).
     body = await request.body()
     key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")
-    ws_url = f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
+    send_body = _convert_action_to_sdk_message_app(body)
+    url = f"http://127.0.0.1:8000/api/conversations/{conversation_id}/events"
+    headers = {"Content-Type": "application/json"}
     if key:
-        ws_url += f"?session_api_key={key}"
+        headers["X-Session-API-Key"] = key
     try:
-        async with _ws.connect(ws_url) as ws:
-            await ws.send(body.decode())
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(url, content=send_body, headers=headers)
     except Exception:
         pass
     return JSONResponse({"success": True})
@@ -575,6 +621,123 @@ with open('/tmp/oh-index.html', 'w') as f:
 print('index.html FakeWS 已注入（使用 /api/proxy/events/ 路径）✓')
 PYEOF
 sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html
+
+# ─── 补丁7b：git-service.js 修复（V1 新建会话 mutationFn 内等待 READY）───
+# 根因：navigate('/conversations/task-xxx') 后 p8() task-mode 路由可能立即重定向到 '/'。
+# 修复：为 mutationFn 添加 poll start-tasks 循环，直接返回真实 conversation_id，
+#       完全绕过 task-mode 路由。
+# 注意：浏览器将 JS 资产缓存为 immutable（max-age=30d），此补丁对清除缓存后生效。
+# index.html task-nav-fix（补丁7c）是兜底手段，对所有浏览器立即生效。
+cat > /tmp/patch_newconv.py << 'GITEOF'
+import shutil
+JS_FILE = '/app/frontend/build/assets/git-service.api-BRugmW99.js'
+with open(JS_FILE) as f:
+    src = f.read()
+if '_tid' in src and 'start-tasks?ids=' in src:
+    print('git-service.js poll 补丁已存在 ✓')
+    exit(0)
+OLD = ('if(!!t?.v1_enabled&&!l){const v=await f.createConversation(r?.name,r?.gitProvider,'
+       's,r?.branch,i,void 0,d,c);return{conversation_id:`task-${v.id}`,session_api_key:null,'
+       'url:v.agent_server_url,v1_task_id:v.id,is_v1:!0}}')
+NEW = ('if(!!t?.v1_enabled&&!l){'
+       'const v=await f.createConversation(r?.name,r?.gitProvider,s,r?.branch,i,void 0,d,c);'
+       'const _tid=v.id;'
+       'for(let _p=0;_p<60;_p++){'
+       'await new Promise(_rr=>setTimeout(_rr,2e3));'
+       'try{'
+       'const _rs=await fetch(`/api/v1/app-conversations/start-tasks?ids=${_tid}`);'
+       'if(_rs.ok){'
+       'const _sd=await _rs.json();'
+       'if(_sd?.[0]?.status==="READY"&&_sd?.[0]?.app_conversation_id){'
+       'return{conversation_id:_sd[0].app_conversation_id,session_api_key:null,'
+       'url:v.agent_server_url,v1_task_id:_tid,is_v1:!0}'
+       '}}'
+       '}catch(_e){}'
+       '}'
+       'throw new Error("V1 conversation start timeout")'
+       '}')
+if OLD not in src:
+    print('WARNING: git-service.js pattern 未匹配，跳过')
+    exit(0)
+shutil.copy(JS_FILE, JS_FILE + '.bak2')
+new_src = src.replace(OLD, NEW, 1)
+with open(JS_FILE, 'w') as f:
+    f.write(new_src)
+print('git-service.js poll 补丁已应用 ✓')
+GITEOF
+sudo docker cp /tmp/patch_newconv.py openhands-app:/tmp/patch_newconv.py
+sudo docker exec openhands-app python3 /tmp/patch_newconv.py
+
+# ─── 补丁7c：index.html task-nav-fix（V1 新建会话跳转兜底）───
+# index.html 注入 task-nav-fix 脚本（index.html 不被 klogin 缓存，立即生效）：
+# 监控 pushState/replaceState，若 URL → /conversations/task-{uuid}，
+# 立即 poll start-tasks，READY 后 window.location.replace 到真实会话页面。
+# 即使浏览器缓存了旧 JS 资产，此脚本也可修复跳转问题。
+cat > /tmp/inject_taskfix.py << 'TASKEOF'
+import re
+INDEX_FILE = '/app/frontend/build/index.html'
+FIX_SCRIPT = '''<script id="task-nav-fix">
+(function(){
+  var _pendingTaskId = null;
+  var _pollDone = false;
+  function _doNavigate(realId) {
+    if (_pollDone) return;
+    _pollDone = true;
+    _pendingTaskId = null;
+    window.location.replace('/conversations/' + realId);
+  }
+  function _startPolling(taskId) {
+    _pendingTaskId = taskId;
+    _pollDone = false;
+    var attempts = 0;
+    function poll() {
+      if (_pollDone || _pendingTaskId !== taskId) return;
+      fetch('/api/v1/app-conversations/start-tasks?ids=' + taskId)
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+          if (_pollDone || _pendingTaskId !== taskId) return;
+          if (data && data[0] && data[0].status === 'READY' && data[0].app_conversation_id) {
+            _doNavigate(data[0].app_conversation_id);
+          } else if (data && data[0] && data[0].status === 'ERROR') {
+            _pendingTaskId = null;
+          } else if (attempts++ < 30) {
+            setTimeout(poll, 2000);
+          }
+        })
+        .catch(function() { if (attempts++ < 30) setTimeout(poll, 2000); });
+    }
+    setTimeout(poll, 300);
+  }
+  function _checkUrl(url) {
+    if (typeof url !== 'string') return;
+    var m = url.match(/^\/conversations\/task-([a-f0-9]{32})$/);
+    if (m) { _startPolling(m[1]); }
+  }
+  var _oPS = history.pushState;
+  var _oRS = history.replaceState;
+  history.pushState = function(s, t, url) { _oPS.apply(this, arguments); _checkUrl(url || window.location.pathname); };
+  history.replaceState = function(s, t, url) { _oRS.apply(this, arguments); _checkUrl(url || window.location.pathname); };
+  window.addEventListener('popstate', function() { _checkUrl(window.location.pathname); });
+  _checkUrl(window.location.pathname);
+})();
+</script>'''
+MARKER = '<!-- TASK-NAV-FIX -->'
+END_MARKER = '<!-- /TASK-NAV-FIX -->'
+with open(INDEX_FILE) as f:
+    src = f.read()
+if MARKER in src:
+    src = re.sub(re.escape(MARKER) + r'.*?' + re.escape(END_MARKER), '', src, flags=re.DOTALL)
+if 'task-nav-fix' in src:
+    src = re.sub(r'<script id="task-nav-fix">.*?</script>', '', src, flags=re.DOTALL)
+full_injection = MARKER + FIX_SCRIPT + END_MARKER
+new_src = src.replace('</head>', full_injection + '</head>', 1)
+assert 'task-nav-fix' in new_src
+with open(INDEX_FILE, 'w') as f:
+    f.write(new_src)
+print('task-nav-fix 已注入 index.html ✓')
+TASKEOF
+sudo docker cp /tmp/inject_taskfix.py openhands-app:/tmp/inject_taskfix.py
+sudo docker exec openhands-app python3 /tmp/inject_taskfix.py
 
 # ─── 补丁8：per-conversation 工作目录隔离 ───
 # 根因：host network sandbox 复用导致所有 V1 会话共用 /workspace/project/，互相可见文件。
@@ -841,6 +1004,9 @@ with open('/tmp/oh-index.html', 'w') as f: f.write(html.replace('<head>', '<head
 print('重启后重新注入 index.html FakeWS ✓')
 INNEREOF
 sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html 2>/dev/null || true
+# 重启后重新应用 git-service.js 和 task-nav-fix 补丁
+sudo docker exec openhands-app python3 /tmp/patch_newconv.py
+sudo docker exec openhands-app python3 /tmp/inject_taskfix.py
 REMOTE
 
 # 4. 建立本地 SSH 隧道并验证
@@ -929,6 +1095,8 @@ echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
 echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
 echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问）"
 echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
+echo "  - git-service.js poll 修复（V1 新建会话直接返回真实 conversation_id）"
+echo "  - task-nav-fix（index.html 兜底脚本，确保浏览器缓存情况下也能跳转会话）"
 echo ""
 echo "访问方式："
 echo "  域名（推荐）: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com"
