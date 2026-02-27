@@ -44,6 +44,10 @@ if ! sudo docker info &>/dev/null 2>&1; then
 fi
 echo "Docker 已安装 ✓"
 
+# 开放防火墙端口（ingress 直连模式需要）
+sudo ufw allow 3000
+echo "ufw allow 3000 ✓"
+
 # 配置 host.docker.internal（必须用 hostname -I，不能用 ifconfig.me）
 EXTERNAL_IP=$(hostname -I | awk '{print $1}')
 echo "实例 IP: $EXTERNAL_IP"
@@ -123,14 +127,19 @@ echo "$SANDBOX_RESULT"
 # ─── 补丁2：agent-server 反向代理路由（修复 V1 Disconnected + 消息无响应）───
 # 问题1：V1 会话的 agent-server URL 是 http://127.0.0.1:8000，浏览器无法直接访问。
 # 问题2：klogin ingress 剥离 WebSocket Upgrade 头，原生 WS 连接失败。
-# 问题3：浏览器发旧 OpenHands action 格式，agent-server v1.10.0-python 期望新 SDK 格式。
+# 问题3（核心）：POST /api/conversations/{id}/events 只存 DB，不唤醒 Python agent asyncio
+#               队列。必须通过 WebSocket 发送才能触发 agent 处理消息！
 # 修复：
 #   - 反向代理路由（HTTP/SSE/WS）让浏览器通过 klogin 访问 agent-server
 #   - SSE 端点替代 WebSocket（klogin 不拦截普通 HTTP）
-#   - POST /api/conversations/{id}/events 专用路由：转换格式后 HTTP POST 给 agent-server
+#   - POST /api/conversations/{id}/events 专用路由：收到 HTTP POST 后内部开 WS 转发
 
 cat > /tmp/agent_server_proxy.py << 'PYEOF'
 import asyncio
+import functools as _ft
+import json as _json_mod
+import socket as _socket_mod
+import http.client as _http_client
 import httpx
 import websockets
 from fastapi import APIRouter, Request, WebSocket, Response
@@ -140,6 +149,39 @@ AGENT_SERVER_HTTP = "http://127.0.0.1:8000"
 AGENT_SERVER_WS = "ws://127.0.0.1:8000"
 
 agent_proxy_router = APIRouter(prefix="/agent-server-proxy")
+
+
+class _UnixHTTPConnection(_http_client.HTTPConnection):
+    def __init__(self, socket_path):
+        super().__init__("localhost")
+        self._socket_path = socket_path
+    def connect(self):
+        s = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+        s.connect(self._socket_path)
+        self.sock = s
+
+@_ft.lru_cache(maxsize=1)
+def _get_agent_server_key() -> str:
+    """Read session_api_key from oh-agent-server via Docker API (Unix socket)."""
+    try:
+        conn = _UnixHTTPConnection("/var/run/docker.sock")
+        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-agent-server%22%5D%7D")
+        resp = conn.getresponse()
+        containers = _json_mod.loads(resp.read())
+        if not containers:
+            return ""
+        cid = containers[0]["Id"]
+        conn2 = _UnixHTTPConnection("/var/run/docker.sock")
+        conn2.request("GET", f"/containers/{cid}/json")
+        resp2 = conn2.getresponse()
+        cdata = _json_mod.loads(resp2.read())
+        env_list = cdata.get("Config", {}).get("Env", [])
+        for e in env_list:
+            if e.startswith("OH_SESSION_API_KEYS_0="):
+                return e.split("=", 1)[1]
+        return ""
+    except Exception:
+        return ""
 
 
 # SSE 端点：将 agent-server WebSocket 转为 SSE（klogin 不拦截 HTTP，会拦截 WS Upgrade）
@@ -210,44 +252,19 @@ async def proxy_websocket(websocket: WebSocket, conversation_id: str):
             pass
 
 
-# 将旧 OpenHands action 格式转换为 agent-server v1.10.0-python SDK SendMessageRequest 格式
-# 旧: {"action": "message", "args": {"content": "...", "image_urls": null}}
-# 新: {"role": "user", "content": [{"type": "text", "text": "..."}], "run": true}
-def _convert_action_to_sdk_message(body: bytes) -> bytes:
-    import json as _json
-    try:
-        data = _json.loads(body)
-        if data.get("action") == "message" and "args" in data:
-            content_str = data["args"].get("content", "")
-            image_urls = data["args"].get("image_urls") or []
-            content_items: list = [{"type": "text", "text": content_str}]
-            for url in image_urls:
-                content_items.append({"type": "image_url", "image_url": {"url": url}})
-            return _json.dumps({
-                "role": "user",
-                "content": content_items,
-                "run": True,
-            }).encode()
-    except Exception:
-        pass
-    return body
-
-
-# POST events: 将 browser 发来的旧 action 格式转换后发给 agent-server（HTTP POST）
+# POST events via WebSocket — HTTP POST到agent-server不唤醒Python agent asyncio队列
 # 必须在 catch-all 之前注册
 @agent_proxy_router.post("/api/conversations/{conversation_id}/events")
 async def proxy_send_event_ws(conversation_id: str, request: Request):
     params = dict(request.query_params)
     key = request.headers.get("X-Session-API-Key", "") or params.get("session_api_key", "")
     body = await request.body()
-    send_body = _convert_action_to_sdk_message(body)
-    url = f"{AGENT_SERVER_HTTP}/api/conversations/{conversation_id}/events"
-    headers: dict = {"Content-Type": "application/json"}
+    ws_url = f"{AGENT_SERVER_WS}/sockets/events/{conversation_id}"
     if key:
-        headers["X-Session-API-Key"] = key
+        ws_url += f"?session_api_key={key}"
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(url, content=send_body, headers=headers)
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(body.decode())
     except Exception:
         pass
     return Response(content='{"success":true}', status_code=200, media_type="application/json")
@@ -260,6 +277,11 @@ async def proxy_http(request: Request, path: str):
     params = dict(request.query_params)
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
+    # Auto-inject session_api_key if not present (Changes tab etc. don't send it)
+    if "x-session-api-key" not in {k.lower() for k in headers} and "session_api_key" not in params:
+        _key = _get_agent_server_key()
+        if _key:
+            headers["X-Session-API-Key"] = _key
     body = await request.body()
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -349,6 +371,31 @@ PYEOF
 sudo docker cp /tmp/patch_rate_limiter.py openhands-app:/tmp/patch_rate_limiter.py
 sudo docker exec openhands-app python3 /tmp/patch_rate_limiter.py
 
+# ─── 补丁2c：CacheControlMiddleware 改为 no-cache（防止浏览器将 JS 资产缓存为 immutable）───
+# 根因：middleware.py 的 CacheControlMiddleware 对所有 /assets/*.js 设置 immutable(max-age=30d)，
+# 导致补丁修改的 JS 文件无法被浏览器重新获取，必须使用全新文件名才能绕过缓存。
+# 修复：改为 no-cache, must-revalidate，让浏览器每次都向服务器确认文件是否更新。
+cat > /tmp/patch_cache_control.py << 'PYEOF'
+with open('/app/openhands/server/middleware.py') as f:
+    src = f.read()
+
+if 'no-cache, must-revalidate' in src and 'immutable' not in src:
+    print('CacheControlMiddleware 已设置 no-cache ✓')
+else:
+    src = src.replace(
+        "'public, max-age=2592000, immutable'",
+        "'no-cache, must-revalidate'"
+    ).replace(
+        '"public, max-age=2592000, immutable"',
+        '"no-cache, must-revalidate"'
+    )
+    with open('/app/openhands/server/middleware.py', 'w') as f:
+        f.write(src)
+    print('CacheControlMiddleware: immutable → no-cache, must-revalidate ✓')
+PYEOF
+sudo docker cp /tmp/patch_cache_control.py openhands-app:/tmp/patch_cache_control.py
+sudo docker exec openhands-app python3 /tmp/patch_cache_control.py
+
 # ─── 补丁3：socket.io polling（修复 V0 会话 Disconnected）───
 # klogin 会剥离 WebSocket Upgrade 头，改为 polling+websocket 顺序，先用 polling
 for JS_ASSET in markdown-renderer-Ci-ahARR.js parse-pr-url-BOXiVwNz.js; do
@@ -399,79 +446,162 @@ PYEOF
 sudo docker cp /tmp/patch_v1svc.py openhands-app:/tmp/patch_v1svc.py
 sudo docker exec openhands-app python3 /tmp/patch_v1svc.py
 
-# ─── 补丁5：should-render-event.js WebSocket → SSE EventSource ───
-# Je() hook 中把 new WebSocket(L) 替换为 EventSource（SSE），
-# SSE 是普通 HTTP 请求，klogin 不拦，即可解决 V1 会话 Disconnected 问题
+# ─── 补丁5：should-render-event.js（已废弃，由 index.html FakeWS 全局 override window.WebSocket）───
+# index.html 的 patch 7 已全局覆盖 window.WebSocket，should-render-event.js 内的 new WebSocket(L)
+# 会自动被 FakeWS 拦截，无需再修改 BMHP.js 文件。
+# 原来此处注入 EventSource 代码会产生有效或无效正则，对浏览器 immutable cache 造成污染，已移除。
+# 保留原版 BMHP.js（有效 JS）以避免 "Invalid regular expression flags" SyntaxError。
 cat > /tmp/patch_sre.py << 'PYEOF'
-path = '/app/frontend/build/assets/should-render-event-D7h-BMHP.js'
-with open(path) as f:
+import os, shutil
+
+ASSETS = '/app/frontend/build/assets'
+bmhp = os.path.join(ASSETS, 'should-render-event-D7h-BMHP.js')
+bmhpx = os.path.join(ASSETS, 'should-render-event-D7h-BMHPx.js')
+
+with open(bmhp) as f:
     src = f.read()
 
 if 'EventSource' in src:
-    print('should-render-event.js SSE 补丁已存在 ✓')
-    exit(0)
-
-B = chr(92)  # backslash, avoids Python escape confusion
-old_ws = 'const O=new WebSocket(L);'
-new_ws = (
-    # Extract conversation_id and session_api_key from the WS URL
-    'const _m=L.match(/' + B + '/sockets' + B + '/events' + B + '/([^?]+)(?:' + B + '?(.*))?/);'
-    'const _id=_m?_m[1]:"";'
-    'const _key=(new URLSearchParams(_m&&_m[2]?_m[2]:"")).get("session_api_key")||"";'
-    # Build SSE URL: ws://host/agent-server-proxy/sockets/events/{id}?... → http://host/.../sse?...
-    'const _su=L.replace(/^ws:/,"http:").replace(/^wss:/,"https:")'
-    '.replace(/(/' + B + '/sockets' + B + '/events' + B + '/[^?]+)/,"$1/sse");'
-    # Fake WebSocket object backed by EventSource
-    'const O={'
-    'readyState:0,onopen:null,onmessage:null,onclose:null,onerror:null,_es:null,'
-    'send:function(d){'
-    'fetch("/agent-server-proxy/api/conversations/"+_id+"/events",'
-    '{method:"POST",headers:{"Content-Type":"application/json","X-Session-API-Key":_key},body:d})'
-    '.catch(function(){});'
-    '},'
-    'close:function(){'
-    'if(O._es){O._es.close();O._es=null;}'
-    'O.readyState=3;'
-    'if(O.onclose)O.onclose({code:1000,reason:"",wasClean:true});'
-    '}'
-    '};'
-    'const _es=new EventSource(_su);O._es=_es;'
-    '_es.addEventListener("open",function(){O.readyState=1;if(O.onopen)O.onopen({})});'
-    '_es.addEventListener("message",function(ev){'
-    'if(ev.data==="__connected__")return;'
-    'if(ev.data==="__closed__"){O.readyState=3;if(O.onclose)O.onclose({code:1000,wasClean:true});return;}'
-    'if(O.onmessage)O.onmessage({data:ev.data});'
-    '});'
-    '_es.addEventListener("error",function(){'
-    'if(O._es){O._es.close();O._es=null;}'
-    'O.readyState=3;if(O.onerror)O.onerror({});'
-    'if(O.onclose)O.onclose({code:1006,reason:"",wasClean:false});'
-    '});'
-)
-
-if old_ws in src:
-    src = src.replace(old_ws, new_ws, 1)
-    with open(path, 'w') as f:
-        f.write(src)
-    print('should-render-event.js SSE 补丁已应用 ✓')
+    # 旧版有 EventSource 注入（可能有 broken regex），还原为原版不可行
+    # 这里只打印警告，patch 5b 会处理 BMHPx 的 cache-bust
+    print('WARNING: BMHP.js has EventSource injection - should be restored to original')
 else:
-    print('WARNING: WebSocket pattern not found in should-render-event.js')
+    print('should-render-event.js 已是原版（无 FakeWS 注入）✓')
+    # 确保 BMHPx.js 也是原版
+    if not os.path.exists(bmhpx) or open(bmhpx).read() != src:
+        shutil.copy2(bmhp, bmhpx)
+        print('BMHPx.js 已同步为原版 ✓')
+    else:
+        print('BMHPx.js 已是原版 ✓')
 PYEOF
 sudo docker cp /tmp/patch_sre.py openhands-app:/tmp/patch_sre.py
 sudo docker exec openhands-app python3 /tmp/patch_sre.py
 
+# ─── 补丁5b：cache busting — 重命名已修改的 JS 文件（bust proxy/browser immutable cache）───
+# should-render-event → BMHPx, conversation-fHdubO7R → Rx, manifest → x, 更新 index.html
+cat > /tmp/patch_cache_bust.py << 'PYEOF'
+import os, shutil
+
+ASSETS = '/app/frontend/build/assets'
+INDEX  = '/app/frontend/build/index.html'
+
+def copy_if_missing(src, dst, label):
+    if os.path.exists(dst):
+        print(f'{label} already exists ✓')
+        return False
+    shutil.copy2(src, dst)
+    print(f'Copied {label}')
+    return True
+
+# Step 1: should-render-event-D7h-BMHP.js → BMHPx.js
+sre_old = os.path.join(ASSETS, 'should-render-event-D7h-BMHP.js')
+sre_new = os.path.join(ASSETS, 'should-render-event-D7h-BMHPx.js')
+copy_if_missing(sre_old, sre_new, 'should-render-event-D7h-BMHPx.js')
+
+# Step 2: update all files that reference old SRE name
+sre_refs = [
+    'conversation-uXvJtyCL.js', 'planner-tab-BB0IaNpo.js',
+    'served-tab-Ath35J_c.js', 'shared-conversation-ly3fwRqE.js',
+    'conversation-fHdubO7R.js', 'changes-tab-CXgkYeVu.js',
+    'vscode-tab-CFaq3Fn-.js', 'manifest-8c9a7105.js',
+]
+for fname in sre_refs:
+    p = os.path.join(ASSETS, fname)
+    if not os.path.exists(p):
+        continue
+    with open(p) as f:
+        src = f.read()
+    if 'should-render-event-D7h-BMHP.js' in src and 'BMHPx' not in src:
+        src = src.replace('should-render-event-D7h-BMHP.js', 'should-render-event-D7h-BMHPx.js')
+        with open(p, 'w') as f:
+            f.write(src)
+        print(f'Updated SRE ref in {fname}')
+
+# Step 3: conversation-fHdubO7R.js → Rx
+conv_old = os.path.join(ASSETS, 'conversation-fHdubO7R.js')
+conv_new = os.path.join(ASSETS, 'conversation-fHdubO7Rx.js')
+copy_if_missing(conv_old, conv_new, 'conversation-fHdubO7Rx.js')
+
+# Step 4: update manifest to reference new conversation file
+mf = os.path.join(ASSETS, 'manifest-8c9a7105.js')
+if os.path.exists(mf):
+    with open(mf) as f:
+        src = f.read()
+    if 'conversation-fHdubO7R.js' in src:
+        src = src.replace('conversation-fHdubO7R.js', 'conversation-fHdubO7Rx.js')
+        with open(mf, 'w') as f:
+            f.write(src)
+        print('Updated conversation ref in manifest-8c9a7105.js')
+
+# Step 5: manifest-8c9a7105.js → x
+mf_new = os.path.join(ASSETS, 'manifest-8c9a7105x.js')
+copy_if_missing(mf, mf_new, 'manifest-8c9a7105x.js')
+
+# Step 6: update index.html to reference new manifest
+with open(INDEX) as f:
+    idx = f.read()
+if 'manifest-8c9a7105.js' in idx:
+    idx = idx.replace('manifest-8c9a7105.js', 'manifest-8c9a7105x.js')
+    with open(INDEX, 'w') as f:
+        f.write(idx)
+    print('Updated manifest ref in index.html')
+elif 'manifest-8c9a7105x.js' in idx:
+    print('index.html already references manifest-8c9a7105x.js ✓')
+else:
+    print('WARNING: manifest not found in index.html')
+
+# Step 7: z-suffix round — 为可能已被浏览器缓存为 immutable 的 x-suffix 文件创建全新 URL
+# conversation-fHdubO7Rx.js → Rz.js（新 URL，浏览器从未见过，必然从服务器获取）
+# manifest-8c9a7105x.js → z.js（引用 Rz，更新 index.html 指向 z）
+# 根因：第一次部署时 immutable 头已生效，x 文件被浏览器缓存了旧内容；z 文件绕过此缓存。
+conv_rx = os.path.join(ASSETS, 'conversation-fHdubO7Rx.js')
+conv_rz = os.path.join(ASSETS, 'conversation-fHdubO7Rz.js')
+mf_x = os.path.join(ASSETS, 'manifest-8c9a7105x.js')
+mf_z = os.path.join(ASSETS, 'manifest-8c9a7105z.js')
+
+if os.path.exists(conv_rx):
+    shutil.copy2(conv_rx, conv_rz)
+    print(f'Created conversation-fHdubO7Rz.js ✓')
+else:
+    print('WARNING: conversation-fHdubO7Rx.js not found, skipping z-rename')
+
+if os.path.exists(mf_x):
+    with open(mf_x) as f:
+        mf_src = f.read()
+    mf_src = mf_src.replace('conversation-fHdubO7Rx.js', 'conversation-fHdubO7Rz.js')
+    with open(mf_z, 'w') as f:
+        f.write(mf_src)
+    print(f'Created manifest-8c9a7105z.js (refs Rz) ✓')
+
+# Update index.html to reference manifest-z (supersedes manifest-x step above)
+with open(INDEX) as f:
+    idx = f.read()
+if 'manifest-8c9a7105z.js' in idx:
+    print('index.html already references manifest-z ✓')
+elif 'manifest-8c9a7105x.js' in idx or 'manifest-8c9a7105.js' in idx:
+    idx = idx.replace('manifest-8c9a7105x.js', 'manifest-8c9a7105z.js')
+    idx = idx.replace('manifest-8c9a7105.js', 'manifest-8c9a7105z.js')
+    with open(INDEX, 'w') as f:
+        f.write(idx)
+    print('Updated index.html: manifest → manifest-z ✓')
+
+print('cache busting 完成 ✓')
+PYEOF
+sudo docker cp /tmp/patch_cache_bust.py openhands-app:/tmp/patch_cache_bust.py
+sudo docker exec openhands-app python3 /tmp/patch_cache_bust.py
+
 # ─── 补丁6：app.py 注入 /api/proxy/events 路由（klogin 转发 /api/*）───
 # klogin 只转发 /api/* 和 /socket.io/*。
 # GET  /api/proxy/events/{id}/stream     — SSE 事件流（FakeWS EventSource 用）
-# POST /api/proxy/conversations/{id}/events — 收 HTTP POST 后转换格式发给 agent-server
-#   agent-server v1.10.0-python 使用 SendMessageRequest 格式（role/content/run），
-#   浏览器仍发旧 OpenHands action 格式，需在此层转换。
+# POST /api/proxy/conversations/{id}/events — 收 HTTP POST 后内部走 WebSocket 发给 agent
+#   ↑ 关键！HTTP POST 直接发给 agent-server 不会唤醒 Python agent asyncio 队列，
+#     必须通过 WebSocket 发送才能触发 LLM 调用。
 cat > /tmp/patch_api_proxy_events.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if '/api/proxy/events' in src and '_convert_action_to_sdk_message_app' in src:
-    print('api/proxy/events 路由（含格式转换）已存在 ✓')
+if '/api/proxy/events' in src and 'Must send via WebSocket' in src and '_AGENT_WS' not in src and 'heartbeat' in src:
+    print('api/proxy/events 路由（含WebSocket修复+heartbeat）已存在 ✓')
     exit(0)
 
 MARKER = 'app.include_router(agent_proxy_router)'
@@ -491,54 +621,45 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     if qs:
         ws_url += f"?{qs}"
     async def _gen():
-        try:
-            async with _ws.connect(ws_url) as ws:
-                yield "data: __connected__\\n\\n"
-                async for msg in ws:
-                    data = msg if isinstance(msg, str) else msg.decode()
-                    data = data.replace("\\n", "\\\\n")
-                    yield f"data: {data}\\n\\n"
-        except Exception:
-            pass
+        import asyncio as _asyncio
+        yield ":heartbeat\\n\\n"  # flush headers immediately (prevents BaseHTTPMiddleware cancel)
+        connected = False
+        _base_qs = "&".join(f"{k}={v}" for k, v in params.items() if k != "resend_all")
+        for attempt in range(30):  # retry up to 90s while conversation starts
+            try:
+                _url = ws_url if attempt == 0 else (
+                    f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
+                    + (f"?{_base_qs}" if _base_qs else "")
+                )
+                async with _ws.connect(_url) as ws:
+                    if not connected:
+                        yield "data: __connected__\\n\\n"
+                        connected = True
+                    async for msg in ws:
+                        data = msg if isinstance(msg, str) else msg.decode()
+                        data = data.replace("\\n", "\\\\n")
+                        yield f"data: {data}\\n\\n"
+                    return  # clean close
+            except Exception:
+                pass
+            await _asyncio.sleep(3)
         yield "data: __closed__\\n\\n"
     return _SR(_gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-def _convert_action_to_sdk_message_app(body: bytes) -> bytes:
-    """Convert old OpenHands action format to agent-server v1.10.0-python SendMessageRequest format."""
-    import json as _json
-    try:
-        data = _json.loads(body)
-        if data.get("action") == "message" and "args" in data:
-            content_str = data["args"].get("content", "")
-            image_urls = data["args"].get("image_urls") or []
-            content_items: list = [{"type": "text", "text": content_str}]
-            for url in image_urls:
-                content_items.append({"type": "image_url", "image_url": {"url": url}})
-            return _json.dumps({
-                "role": "user",
-                "content": content_items,
-                "run": True,
-            }).encode()
-    except Exception:
-        pass
-    return body
-
 @app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)
 async def api_proxy_send_event(conversation_id: str, request: Request):
-    # Convert old OpenHands action format to SDK SendMessageRequest, then HTTP POST to agent-server.
-    # agent-server v1.10.0-python handles HTTP POST natively (no WebSocket needed).
+    # Must send via WebSocket to wake up Python agent's asyncio queue.
+    # HTTP POST only stores event in DB — agent won't see it.
+    import websockets as _ws
     body = await request.body()
     key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")
-    send_body = _convert_action_to_sdk_message_app(body)
-    url = f"http://127.0.0.1:8000/api/conversations/{conversation_id}/events"
-    headers = {"Content-Type": "application/json"}
+    ws_url = f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
     if key:
-        headers["X-Session-API-Key"] = key
+        ws_url += f"?session_api_key={key}"
     try:
-        import httpx as _httpx
-        async with _httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(url, content=send_body, headers=headers)
+        async with _ws.connect(ws_url) as ws:
+            await ws.send(body.decode())
     except Exception:
         pass
     return JSONResponse({"success": True})
@@ -621,123 +742,6 @@ with open('/tmp/oh-index.html', 'w') as f:
 print('index.html FakeWS 已注入（使用 /api/proxy/events/ 路径）✓')
 PYEOF
 sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html
-
-# ─── 补丁7b：git-service.js 修复（V1 新建会话 mutationFn 内等待 READY）───
-# 根因：navigate('/conversations/task-xxx') 后 p8() task-mode 路由可能立即重定向到 '/'。
-# 修复：为 mutationFn 添加 poll start-tasks 循环，直接返回真实 conversation_id，
-#       完全绕过 task-mode 路由。
-# 注意：浏览器将 JS 资产缓存为 immutable（max-age=30d），此补丁对清除缓存后生效。
-# index.html task-nav-fix（补丁7c）是兜底手段，对所有浏览器立即生效。
-cat > /tmp/patch_newconv.py << 'GITEOF'
-import shutil
-JS_FILE = '/app/frontend/build/assets/git-service.api-BRugmW99.js'
-with open(JS_FILE) as f:
-    src = f.read()
-if '_tid' in src and 'start-tasks?ids=' in src:
-    print('git-service.js poll 补丁已存在 ✓')
-    exit(0)
-OLD = ('if(!!t?.v1_enabled&&!l){const v=await f.createConversation(r?.name,r?.gitProvider,'
-       's,r?.branch,i,void 0,d,c);return{conversation_id:`task-${v.id}`,session_api_key:null,'
-       'url:v.agent_server_url,v1_task_id:v.id,is_v1:!0}}')
-NEW = ('if(!!t?.v1_enabled&&!l){'
-       'const v=await f.createConversation(r?.name,r?.gitProvider,s,r?.branch,i,void 0,d,c);'
-       'const _tid=v.id;'
-       'for(let _p=0;_p<60;_p++){'
-       'await new Promise(_rr=>setTimeout(_rr,2e3));'
-       'try{'
-       'const _rs=await fetch(`/api/v1/app-conversations/start-tasks?ids=${_tid}`);'
-       'if(_rs.ok){'
-       'const _sd=await _rs.json();'
-       'if(_sd?.[0]?.status==="READY"&&_sd?.[0]?.app_conversation_id){'
-       'return{conversation_id:_sd[0].app_conversation_id,session_api_key:null,'
-       'url:v.agent_server_url,v1_task_id:_tid,is_v1:!0}'
-       '}}'
-       '}catch(_e){}'
-       '}'
-       'throw new Error("V1 conversation start timeout")'
-       '}')
-if OLD not in src:
-    print('WARNING: git-service.js pattern 未匹配，跳过')
-    exit(0)
-shutil.copy(JS_FILE, JS_FILE + '.bak2')
-new_src = src.replace(OLD, NEW, 1)
-with open(JS_FILE, 'w') as f:
-    f.write(new_src)
-print('git-service.js poll 补丁已应用 ✓')
-GITEOF
-sudo docker cp /tmp/patch_newconv.py openhands-app:/tmp/patch_newconv.py
-sudo docker exec openhands-app python3 /tmp/patch_newconv.py
-
-# ─── 补丁7c：index.html task-nav-fix（V1 新建会话跳转兜底）───
-# index.html 注入 task-nav-fix 脚本（index.html 不被 klogin 缓存，立即生效）：
-# 监控 pushState/replaceState，若 URL → /conversations/task-{uuid}，
-# 立即 poll start-tasks，READY 后 window.location.replace 到真实会话页面。
-# 即使浏览器缓存了旧 JS 资产，此脚本也可修复跳转问题。
-cat > /tmp/inject_taskfix.py << 'TASKEOF'
-import re
-INDEX_FILE = '/app/frontend/build/index.html'
-FIX_SCRIPT = '''<script id="task-nav-fix">
-(function(){
-  var _pendingTaskId = null;
-  var _pollDone = false;
-  function _doNavigate(realId) {
-    if (_pollDone) return;
-    _pollDone = true;
-    _pendingTaskId = null;
-    window.location.replace('/conversations/' + realId);
-  }
-  function _startPolling(taskId) {
-    _pendingTaskId = taskId;
-    _pollDone = false;
-    var attempts = 0;
-    function poll() {
-      if (_pollDone || _pendingTaskId !== taskId) return;
-      fetch('/api/v1/app-conversations/start-tasks?ids=' + taskId)
-        .then(function(r) { return r.ok ? r.json() : null; })
-        .then(function(data) {
-          if (_pollDone || _pendingTaskId !== taskId) return;
-          if (data && data[0] && data[0].status === 'READY' && data[0].app_conversation_id) {
-            _doNavigate(data[0].app_conversation_id);
-          } else if (data && data[0] && data[0].status === 'ERROR') {
-            _pendingTaskId = null;
-          } else if (attempts++ < 30) {
-            setTimeout(poll, 2000);
-          }
-        })
-        .catch(function() { if (attempts++ < 30) setTimeout(poll, 2000); });
-    }
-    setTimeout(poll, 300);
-  }
-  function _checkUrl(url) {
-    if (typeof url !== 'string') return;
-    var m = url.match(/^\/conversations\/task-([a-f0-9]{32})$/);
-    if (m) { _startPolling(m[1]); }
-  }
-  var _oPS = history.pushState;
-  var _oRS = history.replaceState;
-  history.pushState = function(s, t, url) { _oPS.apply(this, arguments); _checkUrl(url || window.location.pathname); };
-  history.replaceState = function(s, t, url) { _oRS.apply(this, arguments); _checkUrl(url || window.location.pathname); };
-  window.addEventListener('popstate', function() { _checkUrl(window.location.pathname); });
-  _checkUrl(window.location.pathname);
-})();
-</script>'''
-MARKER = '<!-- TASK-NAV-FIX -->'
-END_MARKER = '<!-- /TASK-NAV-FIX -->'
-with open(INDEX_FILE) as f:
-    src = f.read()
-if MARKER in src:
-    src = re.sub(re.escape(MARKER) + r'.*?' + re.escape(END_MARKER), '', src, flags=re.DOTALL)
-if 'task-nav-fix' in src:
-    src = re.sub(r'<script id="task-nav-fix">.*?</script>', '', src, flags=re.DOTALL)
-full_injection = MARKER + FIX_SCRIPT + END_MARKER
-new_src = src.replace('</head>', full_injection + '</head>', 1)
-assert 'task-nav-fix' in new_src
-with open(INDEX_FILE, 'w') as f:
-    f.write(new_src)
-print('task-nav-fix 已注入 index.html ✓')
-TASKEOF
-sudo docker cp /tmp/inject_taskfix.py openhands-app:/tmp/inject_taskfix.py
-sudo docker exec openhands-app python3 /tmp/inject_taskfix.py
 
 # ─── 补丁8：per-conversation 工作目录隔离 ───
 # 根因：host network sandbox 复用导致所有 V1 会话共用 /workspace/project/，互相可见文件。
@@ -832,7 +836,7 @@ from fastapi import WebSocket as _FastAPIWebSocket
 @app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
 async def sandbox_port_proxy(port: int, path: str, request: Request):
     """Reverse proxy any sandbox port through openhands-app (port 3000)."""
-    import httpx as _hx
+    import httpx as _hx, re as _re
     target = f"http://127.0.0.1:{port}/{path}"
     qs = str(request.query_params)
     if qs:
@@ -840,15 +844,50 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
     body = await request.body()
+    proxy_base = f"/api/sandbox-port/{port}"
     try:
-        async with _hx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        async with _hx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
             resp = await client.request(
                 method=request.method, url=target, headers=headers, content=body)
-            resp_headers = {k: v for k, v in resp.headers.items()
-                           if k.lower() not in ("content-encoding", "transfer-encoding", "connection")}
+            resp_headers = {}
+            for k, v in resp.headers.multi_items():
+                if k.lower() in ("content-encoding", "transfer-encoding", "connection",
+                                  "content-security-policy"):
+                    continue
+                if k.lower() == "location":
+                    if v.startswith("http://127.0.0.1") or v.startswith("http://localhost"):
+                        v = _re.sub(r"https?://[^/]+", proxy_base, v, count=1)
+                    elif v.startswith("/") and not v.startswith(proxy_base):
+                        v = proxy_base + v
+                resp_headers[k] = v
+            content = resp.content
+            ct = resp.headers.get("content-type", "")
+            if "text/html" in ct and content:
+                try:
+                    html = content.decode("utf-8")
+                    def _rewrite_abs(m):
+                        attr, url = m.group(1), m.group(2)
+                        if url.startswith(proxy_base):
+                            return m.group(0)
+                        return attr + proxy_base + url
+                    html = _re.sub(
+                        r"""((?:src|href|action)=["'])(/[^/"'#][^"']*)""",
+                        _rewrite_abs, html)
+                    html = html.replace(
+                        "&quot;serverBasePath&quot;:&quot;/&quot;",
+                        "&quot;serverBasePath&quot;:&quot;" + proxy_base + "/&quot;")
+                    html = _re.sub(
+                        r"(new URL\(')(/stable-[^']+)(')",
+                        lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3), html)
+                    html = _re.sub(
+                        r"&quot;remoteAuthority&quot;:&quot;[^&]*&quot;",
+                        "&quot;remoteAuthority&quot;:&quot;&quot;", html)
+                    content = html.encode("utf-8")
+                except Exception:
+                    pass
             from starlette.responses import Response as _Resp
-            return _Resp(content=resp.content, status_code=resp.status_code,
-                        headers=resp_headers, media_type=resp.headers.get("content-type"))
+            return _Resp(content=content, status_code=resp.status_code,
+                        headers=resp_headers, media_type=ct or resp.headers.get("content-type"))
     except Exception as e:
         from starlette.responses import Response as _Resp
         return _Resp(content=str(e), status_code=502)
@@ -962,6 +1001,108 @@ PYEOF
 sudo docker cp /tmp/patch_sandbox_exposed_urls.py openhands-app:/tmp/patch_sandbox_exposed_urls.py
 sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
 
+# ─── 补丁11：vscode-tab JS 修复 + z-suffix cache busting ───
+# 根因：new URL(r.url) 当 r.url 是相对路径时抛 TypeError → "Error parsing URL"
+# 修复：new URL(r.url, window.location.origin)
+# 由于 assets 被标记 immutable，需要创建新文件名（z 后缀）打破缓存链
+cat > /tmp/patch_vscode_tab.py << 'PYEOF'
+import os, shutil, re
+
+ASSETS = '/app/frontend/build/assets'
+
+# 1. Fix vscode-tab JS files (both - and x suffix)
+OLD_URL = 'if(r?.url)try{const f=new URL(r.url).protocol'
+NEW_URL = 'if(r?.url)try{const f=new URL(r.url,window.location.origin).protocol'
+
+for fname in ['vscode-tab-CFaq3Fn-.js', 'vscode-tab-CFaq3Fn-x.js']:
+    p = os.path.join(ASSETS, fname)
+    if not os.path.exists(p):
+        print(f'{fname}: not found, skipping')
+        continue
+    with open(p) as f:
+        src = f.read()
+    if NEW_URL in src:
+        print(f'{fname}: already patched ✓')
+    elif OLD_URL in src:
+        src = src.replace(OLD_URL, NEW_URL, 1)
+        with open(p, 'w') as f:
+            f.write(src)
+        print(f'{fname}: URL parse fix applied ✓')
+    else:
+        print(f'{fname}: WARNING pattern not found')
+
+# 2. Create vscode-tab-CFaq3Fn-z.js from patched original (prefer x if exists)
+src_x = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-x.js')
+src_orig = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-.js')
+dst_z = os.path.join(ASSETS, 'vscode-tab-CFaq3Fn-z.js')
+vt_src = src_x if os.path.exists(src_x) else src_orig
+if os.path.exists(vt_src):
+    shutil.copy2(vt_src, dst_z)
+    print(f'Created vscode-tab-CFaq3Fn-z.js (from {os.path.basename(vt_src)}) ✓')
+else:
+    print('WARNING: no vscode-tab source found')
+
+# 3. Determine uXvJtyCL source (prefer x if exists, fall back to plain)
+conv_x    = os.path.join(ASSETS, 'conversation-uXvJtyCLx.js')
+conv_orig = os.path.join(ASSETS, 'conversation-uXvJtyCL.js')
+conv_src  = conv_x if os.path.exists(conv_x) else conv_orig
+
+# 4. Create conversation-uXvJtyCLz.js (copy of best available source)
+conv_z = os.path.join(ASSETS, 'conversation-uXvJtyCLz.js')
+if os.path.exists(conv_src):
+    shutil.copy2(conv_src, conv_z)
+    print(f'Created conversation-uXvJtyCLz.js (from {os.path.basename(conv_src)}) ✓')
+else:
+    print('WARNING: no conversation-uXvJtyCL source found')
+
+# 5. Update uXvJtyCLz.js to reference vscode-tab-z (replace all vscode-tab- variants)
+if os.path.exists(conv_z):
+    with open(conv_z) as f:
+        csrc = f.read()
+    if 'vscode-tab-CFaq3Fn-z.js' not in csrc:
+        csrc2 = csrc.replace('vscode-tab-CFaq3Fn-x.js', 'vscode-tab-CFaq3Fn-z.js')
+        csrc2 = csrc2.replace('vscode-tab-CFaq3Fn-.js', 'vscode-tab-CFaq3Fn-z.js')
+        with open(conv_z, 'w') as f:
+            f.write(csrc2)
+        print('Updated uXvJtyCLz.js: vscode-tab → vscode-tab-z ✓')
+    else:
+        print('uXvJtyCLz.js already refs vscode-tab-z ✓')
+
+# 6. Update conversation-fHdubO7Rz.js to import uXvJtyCLz
+conv_rz = os.path.join(ASSETS, 'conversation-fHdubO7Rz.js')
+if os.path.exists(conv_rz):
+    with open(conv_rz) as f:
+        rzc = f.read()
+    if 'uXvJtyCLz' not in rzc:
+        rzc2 = rzc.replace('conversation-uXvJtyCLx.js', 'conversation-uXvJtyCLz.js')
+        rzc2 = rzc2.replace('conversation-uXvJtyCL.js', 'conversation-uXvJtyCLz.js')
+        if rzc2 != rzc:
+            with open(conv_rz, 'w') as f:
+                f.write(rzc2)
+            print('Updated conversation-fHdubO7Rz.js → uXvJtyCLz ✓')
+    else:
+        print('fHdubO7Rz already refs uXvJtyCLz ✓')
+
+# 7. Update manifest-z to reference uXvJtyCLz (for modulepreload hints)
+mz = os.path.join(ASSETS, 'manifest-8c9a7105z.js')
+if os.path.exists(mz):
+    with open(mz) as f:
+        mzc = f.read()
+    if 'uXvJtyCLz' not in mzc:
+        mzc2 = mzc.replace('conversation-uXvJtyCLx.js', 'conversation-uXvJtyCLz.js')
+        mzc2 = mzc2.replace('conversation-uXvJtyCL.js', 'conversation-uXvJtyCLz.js')
+        if mzc2 != mzc:
+            with open(mz, 'w') as f:
+                f.write(mzc2)
+            print('Updated manifest-z → uXvJtyCLz ✓')
+    else:
+        print('manifest-z already refs uXvJtyCLz ✓')
+
+print('Chain: manifest-z → fHdubO7Rz → uXvJtyCLz → BMHPx + vscode-tab-z ✓')
+PYEOF
+sudo docker cp /tmp/patch_vscode_tab.py openhands-app:/tmp/patch_vscode_tab.py
+sudo docker exec openhands-app python3 /tmp/patch_vscode_tab.py
+
 # ─── 重启 openhands-app 使所有 Python 补丁生效 ───
 echo ""
 echo ">>> 重启 openhands-app 使补丁生效..."
@@ -1004,12 +1145,19 @@ with open('/tmp/oh-index.html', 'w') as f: f.write(html.replace('<head>', '<head
 print('重启后重新注入 index.html FakeWS ✓')
 INNEREOF
 sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html 2>/dev/null || true
-# 重启后重新应用 git-service.js 和 task-nav-fix 补丁
-sudo docker exec openhands-app python3 /tmp/patch_newconv.py
-sudo docker exec openhands-app python3 /tmp/inject_taskfix.py
 REMOTE
 
-# 4. 建立本地 SSH 隧道并验证
+# 4. 配置 klogin ingress（域名访问，只需运行一次）
+echo ""
+echo ">>> 配置 klogin ingress..."
+# 确保实例有静态 IP（ingress 必需）
+klogin instances update "$INSTANCE_ID" --static-ip 2>/dev/null && echo "静态 IP 已设置 ✓" || echo "静态 IP 已存在或设置失败（可忽略）"
+# 创建 ingress（已存在则跳过）
+klogin ingresses create openhands --instance "$INSTANCE_ID" --port 3000 --access-control=false 2>/dev/null \
+  && echo "ingress 创建成功 ✓" \
+  || echo "ingress 已存在或创建失败（可忽略，域名: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com）"
+
+# 5. 建立本地 SSH 隧道并验证
 echo ""
 echo ">>> 建立本地隧道并验证..."
 pkill -f "ssh.*-L 3001.*$INSTANCE_ID" 2>/dev/null || true
@@ -1088,15 +1236,18 @@ echo "========================================"
 echo "✓ 部署完成！所有补丁已应用："
 echo "  - sandbox 复用（防 401）"
 echo "  - agent-server 反向代理（HTTP + SSE）"
+echo "  - CacheControlMiddleware: no-cache 替代 immutable（防浏览器永久缓存 JS 补丁）"
 echo "  - socket.io polling 回退（V0 会话）"
 echo "  - /api/proxy/events SSE 路由（klogin 可转发，修复 V1 Disconnected）"
 echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
 echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
-echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问）"
+echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问，CSP stripped, remoteAuthority cleared）"
 echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
+echo "  - vscode-tab URL parse fix（new URL relative path fix + z-suffix cache busting）"
 echo "  - git-service.js poll 修复（V1 新建会话直接返回真实 conversation_id）"
 echo "  - task-nav-fix（index.html 兜底脚本，确保浏览器缓存情况下也能跳转会话）"
+echo "  - cache busting z-suffix（manifest/conversation JS 全新 URL，清除旧 immutable 缓存）"
 echo ""
 echo "访问方式："
 echo "  域名（推荐）: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com"
