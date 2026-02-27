@@ -784,8 +784,9 @@ import re as _re
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if 'agent_server_proxy' in src and 'api/proxy/events' in src and '_resolve_conversation_id' in src and 'heartbeat' in src:
-    print('app.py 所有路由（含 heartbeat）已存在 ✓')
+if ('agent_server_proxy' in src and 'api/proxy/events' in src and '_resolve_conversation_id' in src
+        and 'wait_for(ws.recv()' in src and 'data.get("role") == "user"' in src):
+    print('app.py 所有路由（含 heartbeat + run:true fix）已存在 ✓')
     exit(0)
 
 # 注入 import
@@ -807,10 +808,12 @@ if MARKER not in src:
     print('WARNING: include_router(agent_proxy_router) not found in app.py')
     exit(1)
 
-# 注入 /api/proxy/events SSE + send 路由（动态 URL + heartbeat）
-if 'api/proxy/events' not in src or '_resolve_conversation_id' not in src or 'heartbeat' not in src:
-    # Remove old injection if present (missing heartbeat)
-    if 'api/proxy/events' in src and 'heartbeat' not in src:
+# 注入 /api/proxy/events SSE + send 路由（动态 URL + 15s heartbeat + run:true fix）
+_routes_ok = ('api/proxy/events' in src and '_resolve_conversation_id' in src
+              and 'wait_for(ws.recv()' in src and 'data.get("role") == "user"' in src)
+if not _routes_ok:
+    # Remove old injection if present (missing 15s heartbeat or run:true fix)
+    if 'api/proxy/events' in src:
         src = _re.sub(
             r'\n@app\.get\("/api/proxy/events/\{conversation_id\}/stream".*?(?=\n@app\.|$)',
             '', src, flags=_re.DOTALL)
@@ -820,7 +823,7 @@ if 'api/proxy/events' not in src or '_resolve_conversation_id' not in src or 'he
         src = _re.sub(
             r'\n@app\.post\("/api/proxy/conversations/\{conversation_id\}/events".*?(?=\n@app\.|$)',
             '', src, flags=_re.DOTALL)
-        print('旧路由已移除（补充 heartbeat）')
+        print('旧路由已移除（重新注入含 15s heartbeat + run:true fix）')
 
     new_routes = '''
 @app.get("/api/proxy/events/{conversation_id}/stream", include_in_schema=False)
@@ -849,22 +852,41 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
                     if first:
                         yield "data: __connected__\\n\\n"
                         first = False
-                    async for msg in ws:
-                        data = msg if isinstance(msg, str) else msg.decode()
-                        data = data.replace("\\n", "\\\\n")
-                        yield f"data: {data}\\n\\n"
+                    # Heartbeat loop: recv with 15s timeout so SSE stays alive
+                    # through klogin proxy (which kills idle connections after ~60s).
+                    while True:
+                        try:
+                            msg = await _aio.wait_for(ws.recv(), timeout=15.0)
+                            data = msg if isinstance(msg, str) else msg.decode()
+                            data = data.replace("\\n", "\\\\n")
+                            yield f"data: {data}\\n\\n"
+                        except _aio.TimeoutError:
+                            yield ":heartbeat\\n\\n"
+                        except Exception:
+                            break  # WS closed
             except Exception:
                 if first:
                     yield "data: __closed__\\n\\n"
                     return
+            yield ":heartbeat\\n\\n"
             await _aio.sleep(1)
     return _SR(_gen(), media_type="text/event-stream",
                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 def _convert_action_to_sdk_message_bridge(body: bytes) -> bytes:
+    """Convert action to agent-server SendMessageRequest format with run:true.
+
+    Handles two cases:
+    1. Old V0 format: {"action":"message","args":{"content":"..."}} -> SDK with run:true
+    2. V1 SDK format: {"role":"user","content":[...]} missing run:true -> add run:true
+
+    The V1 frontend (BMHP.js tn() hook) sends SDK format WITHOUT run:true via
+    n.sendMessage({role:"user",content:[...]}), so agent stores msg but never runs.
+    """
     import json as _json
     try:
         data = _json.loads(body)
+        # Case 1: old V0 action format
         if data.get("action") == "message" and "args" in data:
             content_str = data["args"].get("content", "")
             image_urls = data["args"].get("image_urls") or []
@@ -876,6 +898,10 @@ def _convert_action_to_sdk_message_bridge(body: bytes) -> bytes:
                 "content": content_items,
                 "run": True,
             }).encode()
+        # Case 2: V1 SDK format missing run:true
+        if data.get("role") == "user" and "content" in data and not data.get("run"):
+            data["run"] = True
+            return _json.dumps(data).encode()
     except Exception:
         pass
     return body
@@ -903,9 +929,9 @@ async def api_proxy_send_event(conversation_id: str, request: Request):
 
 '''
     src = src.replace(MARKER, MARKER + '\n' + new_routes, 1)
-    print('api/proxy/events 路由（含 heartbeat + 动态 URL）已注入 ✓')
+    print('api/proxy/events 路由（含 15s heartbeat + 动态 URL + run:true fix）已注入 ✓')
 else:
-    print('api/proxy/events 路由已存在 ✓')
+    print('api/proxy/events 路由（15s heartbeat + run:true fix）已存在 ✓')
 
 with open('/app/openhands/server/app.py', 'w') as f:
     f.write(src)
@@ -1542,7 +1568,7 @@ echo "  - bridge-P3:  socket.io polling 回退（V0 会话）"
 echo "  - bridge-P4:  v1-svc.js 路由 → /agent-server-proxy"
 echo "  - bridge-P5:  BMHP.js 还原原版（FakeWS 全局 override，无需修改 BMHP.js）"
 echo "  - bridge-P5b: cache-bust x/z suffix（bypass 浏览器 immutable 缓存）"
-echo "  - bridge-P6:  app.py 路由（SSE heartbeat + 动态 URL + 格式转换）"
+echo "  - bridge-P6:  app.py 路由（SSE 15s heartbeat + 动态 URL + 格式转换 + run:true fix）"
 echo "  - bridge-P7:  index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - bridge-P8:  per-conversation workspace 隔离"
 echo "  - bridge-P9:  sandbox port proxy（Code/App tab 访问，CSP stripped）"
