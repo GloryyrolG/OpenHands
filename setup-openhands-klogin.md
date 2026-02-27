@@ -69,26 +69,42 @@ bash setup-openhands-klogin-{variant}.sh
 
 ### 补丁9+10+11 详细说明：Code/App tab 访问（sandbox port proxy）
 
-**问题**：OpenHands 侧边栏的 Code tab（VSCode 编辑器）和 App tab（应用预览）通过 `exposed_urls` 中的 `http://127.0.0.1:{port}` URL 打开 iframe。klogin 用户的浏览器无法直接访问远程机器的 127.0.0.1，导致这些 tab 显示空白或报错。
+**问题根因**：VSCode/App 服务跑在服务器上，地址是 `http://127.0.0.1:{port}`（HTTP）。浏览器页面是 HTTPS，安全规定不允许 HTTPS 页面加载 HTTP 内容（mixed content），直接嵌 iframe 会被拒绝。
+
+**核心思路**：在服务器上加一个路由作为中转——浏览器只跟同一个 HTTPS 域名说话，服务器在内部把请求转给真实端口。本质上是「用路径区分端口」而不是「用不同子域名区分端口」：
+
+```
+路径方案（我们用的）： https://openhands.svc.xxx.../api/sandbox-port/8001/
+子域名方案（未采用）： https://app8001.svc.xxx.../
+```
+
+路径方案的好处：一个 klogin ingress 搞定所有端口，不需要为每个端口单独创建 ingress。
 
 **方案**：
-- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由，作为 HTTP/WebSocket 反向代理。浏览器请求经 klogin → openhands-app（`{APP_PORT}` 端口）→ 转发到目标服务。
-  - **bridge-mode 专属**：固定端口（VSCode/App 8001/8011/8012）由 bridge-P10 改写为宿主机映射端口，`127.0.0.1:{host_port}` 可达；用户自启 app（如 8506）仅在容器内，`_find_bridge_target(port)` 先探测 `127.0.0.1:{port}`，失败则扫描 `oh-bridge-*` 容器找对应容器 IP，使用 `http://{container_ip}:{port}` 转发。
-  - **klogin-deploy**（host network）：所有端口直接 `127.0.0.1:{port}` 可达。
-- **补丁10**：在 `_container_to_sandbox_info()` 中，返回 `SandboxInfo` 前将 VSCODE/WORKER 的 `exposed_urls` 从 `http://127.0.0.1:{port}` 改写为 `/api/sandbox-port/{port}`（相对路径）。AGENT_SERVER URL 保持绝对路径不变（health check 需要）。
-  - 改写为相对路径还解决了「跨域 Cookie 警告」：`new URL('/api/sandbox-port/...', window.location.origin).protocol` 与页面 `https:` 一致，不再触发协议不匹配判断。
-- **补丁11**：`vscode-tab-*.js` 中 `new URL(r.url)` 对相对 URL 会抛 TypeError（无 base）→ 改为 `new URL(r.url, window.location.origin)`。同时以 z-suffix 重命名新文件绕过浏览器 30d `immutable` 缓存。
+- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由（OpenHands 原生不支持，我们自己加的），作为 HTTP/WebSocket 反向代理。URL 里的端口号直接读出来转发，不查表。
+  - **klogin-deploy**（host network）：所有端口在宿主机上直接可达，`127.0.0.1:{port}` 即可。VSCode 永远在 8001，所有会话共用同一个地址（只有 `tkn` 不同）。
+  - **bridge-mode**：固定端口（VSCode 8001/App 8011/8012）由 Docker 发布到宿主机随机端口（如 47131），P10 改写后转发随机端口；用户自启 app（如 8506）仅在容器内，`_find_bridge_target()` 扫描容器 IP 转发。
+- **补丁10**：把 `exposed_urls` 里的 `http://127.0.0.1:{port}` 改写为 `/api/sandbox-port/{port}`（相对路径），让前端拿到可用的 URL。改为相对路径还消除了协议不匹配（`http:` vs `https:`）导致的跨域 Cookie 警告。
+- **补丁11**：前端 JS 解析相对路径时崩溃（`new URL('/api/...')` 无 base 会报错），改为 `new URL(url, window.location.origin)` 修复；z-suffix 重命名绕过浏览器 30d immutable 缓存。
+
+**直接访问 VSCode**（不通过 OpenHands UI）：
+```bash
+# 查询某个会话的 VSCode 完整 URL
+curl -s "http://localhost:{APP_PORT}/api/v1/sandboxes?id=<sandbox_id>" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for eu in d[0].get('exposed_urls') or []:
+    if eu['name'] == 'VSCODE':
+        print('https://{INGRESS_NAME}.svc.<instance-id>.klogin-user.mlplatform.apple.com' + eu['url'])
+"
+```
 
 **验证**：
 ```bash
-# sandbox port proxy 是否存在（需要 sandbox 在运行中）
-curl -s "http://localhost:{TUNNEL_PORT}/api/sandbox-port/8001/?tkn=<session_api_key>&folder=/workspace/project"
-# → 应返回 200 OK + VSCode HTML
-
 # exposed_urls 是否正确重写
-curl -s "http://localhost:{TUNNEL_PORT}/api/v1/sandboxes?id=<sandbox_id>" | python3 -m json.tool
-# VSCODE.url 应为 /api/sandbox-port/{host_port}/...（相对路径，不是 http://127.0.0.1:...）
-# AGENT_SERVER.url 应为 http://127.0.0.1:{port}（保持绝对路径）
+curl -s "http://localhost:{APP_PORT}/api/v1/sandboxes?id=<sandbox_id>" | python3 -m json.tool
+# VSCODE.url 应为 /api/sandbox-port/{port}/...（相对路径）
+# AGENT_SERVER.url 应为 http://127.0.0.1:{port}（保持绝对路径，health check 需要）
 ```
 
 ---
