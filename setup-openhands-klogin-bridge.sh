@@ -614,7 +614,7 @@ sudo docker exec openhands-app-bridge python3 /tmp/bridge_patch_v1svc.py
 # 原来往 BMHP.js 注入 EventSource 代码会产生 broken regex，被浏览器缓存为 immutable，已废弃。
 # ─────────────────────────────────────────────────────────────
 cat > /tmp/bridge_patch_sre.py << 'PYEOF'
-import os, shutil
+import os, shutil, subprocess
 
 ASSETS = '/app/frontend/build/assets'
 bmhp = os.path.join(ASSETS, 'should-render-event-D7h-BMHP.js')
@@ -624,15 +624,40 @@ with open(bmhp) as f:
     src = f.read()
 
 if 'EventSource' in src:
-    print('WARNING: BMHP.js has EventSource injection - should be restored to original')
+    # Restore original from Docker image (host-side docker needed)
+    # Since we're inside the container, skip docker pull; rely on host to have done this
+    print('WARNING: BMHP.js has EventSource injection ({} bytes)'.format(len(src)))
+    print('  Run on host: sudo docker create --name tmp-oh docker.openhands.dev/openhands/openhands:1.3')
+    print('  sudo docker cp tmp-oh:/app/frontend/build/assets/should-render-event-D7h-BMHP.js /tmp/orig_BMHP.js')
+    print('  sudo docker rm tmp-oh && sudo chmod 644 /tmp/orig_BMHP.js')
+    print('  sudo docker cp /tmp/orig_BMHP.js openhands-app-bridge:/app/frontend/build/assets/should-render-event-D7h-BMHP.js')
 else:
     print('should-render-event.js 已是原版（无 FakeWS 注入）✓')
-    if not os.path.exists(bmhpx) or open(bmhpx).read() != src:
-        shutil.copy2(bmhp, bmhpx)
-        print('BMHPx.js 已同步为原版 ✓')
-    else:
-        print('BMHPx.js 已是原版 ✓')
+
+# Sync BMHPx.js regardless
+with open(bmhp) as f:
+    src = f.read()
+if not os.path.exists(bmhpx) or open(bmhpx).read() != src:
+    shutil.copy2(bmhp, bmhpx)
+    print('BMHPx.js 已同步 ✓')
+else:
+    print('BMHPx.js 已是最新 ✓')
 PYEOF
+# Extract original BMHP.js from Docker image and copy to container
+if ! sudo docker exec openhands-app-bridge python3 -c "
+import os
+p = '/app/frontend/build/assets/should-render-event-D7h-BMHP.js'
+with open(p) as f: s = f.read()
+exit(0 if 'EventSource' not in s else 1)
+" 2>/dev/null; then
+    echo ">>> bridge-P5: BMHP.js 有 EventSource 注入，从 Docker 镜像恢复原版..."
+    sudo docker create --name tmp-oh-sre docker.openhands.dev/openhands/openhands:1.3 2>/dev/null
+    sudo docker cp tmp-oh-sre:/app/frontend/build/assets/should-render-event-D7h-BMHP.js /tmp/orig_sre_BMHP.js
+    sudo chmod 644 /tmp/orig_sre_BMHP.js
+    sudo docker rm tmp-oh-sre 2>/dev/null
+    sudo docker cp /tmp/orig_sre_BMHP.js openhands-app-bridge:/app/frontend/build/assets/should-render-event-D7h-BMHP.js
+    echo "BMHP.js 已恢复原版 ✓"
+fi
 sudo docker cp /tmp/bridge_patch_sre.py openhands-app-bridge:/tmp/bridge_patch_sre.py
 sudo docker exec openhands-app-bridge python3 /tmp/bridge_patch_sre.py
 
@@ -1474,7 +1499,7 @@ else
             # 验证 DB 中记录了独立的 agent_server_url
             ssh "$INSTANCE_ID" "sudo docker exec openhands-app-bridge python3 -c \"
 import sqlite3
-conn = sqlite3.connect('/.openhands/openhands.db')
+conn = sqlite3.connect('/root/.openhands/openhands.db')
 cur = conn.cursor()
 cur.execute('SELECT app_conversation_id, sandbox_id, agent_server_url FROM app_conversation_start_task ORDER BY created_at DESC LIMIT 3')
 for r in cur.fetchall():
