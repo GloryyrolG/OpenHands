@@ -193,34 +193,117 @@ import asyncio
 import re
 import httpx
 import websockets
+import subprocess as _sp
+import functools as _ft
+import sqlite3 as _sqlite3
 from fastapi import APIRouter, Request, WebSocket, Response
 from starlette.responses import StreamingResponse
 
-# Bridge 模式：每个 conversation 有独立 agent-server（不同端口），动态路由
-_BRIDGE_PORT = 3002  # openhands-app-bridge 本身的端口
-_url_cache: dict[str, str] = {}  # conversation_id → agent_server base URL
+# Bridge mode: each conversation has its own agent-server (different port), dynamic routing
+_BRIDGE_PORT = 3002  # openhands-app-bridge own port
+_url_cache: dict[str, str] = {}   # conversation_id -> agent_server base URL
+_conv_id_cache: dict[str, str] = {}  # raw_id -> real app_conversation_id
 
 agent_proxy_router = APIRouter(prefix='/agent-server-proxy')
 
+_DB_PATH = '/root/.openhands/openhands.db'
+
+
+@_ft.lru_cache(maxsize=1)
+def _get_agent_server_key() -> str:
+    """Read session_api_key from running oh-agent-server container env."""
+    try:
+        cid = _sp.check_output(
+            ['docker', 'ps', '--filter', 'name=oh-agent-server', '--format', '{{.ID}}'],
+            timeout=5
+        ).decode().strip().splitlines()[0].strip()
+        if not cid:
+            return ''
+        return _sp.check_output(
+            ['docker', 'exec', cid, 'sh', '-c', 'echo $OH_SESSION_API_KEYS_0'],
+            timeout=5
+        ).decode().strip()
+    except Exception:
+        return ''
+
+
+def _resolve_id_via_db(raw_id: str) -> str:
+    """Query SQLite: resolve V1 task ID or app_conversation_id -> agent_server_url."""
+    clean = raw_id.removeprefix('task-')
+    try:
+        conn = _sqlite3.connect(_DB_PATH, timeout=3)
+        cur = conn.cursor()
+        cur.execute(
+            '''SELECT agent_server_url FROM app_conversation_start_task
+               WHERE (id=? OR app_conversation_id=?) AND status="READY"
+               ORDER BY created_at DESC LIMIT 1''',
+            (clean, clean)
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return ''
+
+
+def _resolve_conversation_id(raw_id: str) -> str:
+    """Resolve task-xxx or V1 task ID -> real app_conversation_id."""
+    if raw_id in _conv_id_cache:
+        return _conv_id_cache[raw_id]
+    clean = raw_id.removeprefix('task-')
+    try:
+        conn = _sqlite3.connect(_DB_PATH, timeout=3)
+        cur = conn.cursor()
+        cur.execute(
+            'SELECT app_conversation_id FROM app_conversation_start_task WHERE id=? LIMIT 1',
+            (clean,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            result = row[0]
+            _conv_id_cache[raw_id] = result
+            _conv_id_cache[clean] = result
+            return result
+    except Exception:
+        pass
+    _conv_id_cache[raw_id] = clean
+    return clean
+
 
 async def _get_agent_server_url(conversation_id: str) -> str:
-    """从本地 openhands API 查询对应 conversation 的 agent-server base URL，带内存缓存。"""
+    """Resolve conversation_id (task-xxx, V1 task id, or app_conversation_id) -> agent-server base URL."""
+    clean = conversation_id.removeprefix('task-')
+    if clean in _url_cache:
+        return _url_cache[clean]
     if conversation_id in _url_cache:
         return _url_cache[conversation_id]
+
+    # 1. SQLite DB (fastest, handles task id AND app_conversation_id)
+    agent_url = _resolve_id_via_db(clean)
+    if agent_url:
+        _url_cache[clean] = agent_url
+        _url_cache[conversation_id] = agent_url
+        return agent_url
+
+    # 2. HTTP API fallback
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
-                f'http://127.0.0.1:{_BRIDGE_PORT}/api/conversations/{conversation_id}'
+                f'http://127.0.0.1:{_BRIDGE_PORT}/api/conversations/{clean}'
             )
             data = resp.json()
-            url = data.get('url', '')
+            url = data.get('url', '') if data else ''
             if url and '://' in url:
-                # url = "http://127.0.0.1:PORT/api/conversations/..."
                 base_url = url.split('/api/conversations/')[0]
+                _url_cache[clean] = base_url
                 _url_cache[conversation_id] = base_url
                 return base_url
     except Exception:
         pass
+
     return 'http://127.0.0.1:8000'  # fallback
 
 
@@ -228,23 +311,23 @@ def _to_ws(http_url: str) -> str:
     return http_url.replace('http://', 'ws://').replace('https://', 'wss://')
 
 
-# ── SSE 端点：WS→SSE + 自动重连（agent-server 发完 backlog 后会关闭 WS）──
+# -- SSE proxy: WS -> SSE (klogin strips WS Upgrade headers) --
 @agent_proxy_router.get('/sockets/events/{conversation_id}/sse')
 async def proxy_sse(request: Request, conversation_id: str):
     base_url = await _get_agent_server_url(conversation_id)
+    real_id = _resolve_conversation_id(conversation_id)
     params = dict(request.query_params)
     qs = '&'.join(f'{k}={v}' for k, v in params.items())
-    ws_url = f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+    ws_url = f"{_to_ws(base_url)}/sockets/events/{real_id}"
     if qs:
         ws_url += f'?{qs}'
 
     async def generate():
-        import asyncio
         first = True
         _base_qs = qs.replace('resend_all=true&', '').replace('&resend_all=true', '').replace('resend_all=true', '')
         while True:
             try:
-                _url = ws_url if first else f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+                _url = ws_url if first else f"{_to_ws(base_url)}/sockets/events/{real_id}"
                 if not first and _base_qs:
                     _url += f'?{_base_qs}'
                 async with websockets.connect(_url) as ws:
@@ -266,18 +349,19 @@ async def proxy_sse(request: Request, conversation_id: str):
     )
 
 
-# ── WebSocket 代理（备用）──
+# -- WebSocket proxy (fallback) --
 @agent_proxy_router.websocket('/sockets/events/{conversation_id}')
 async def proxy_websocket(websocket: WebSocket, conversation_id: str):
     await websocket.accept()
     base_url = await _get_agent_server_url(conversation_id)
+    real_id = _resolve_conversation_id(conversation_id)
     params = dict(websocket.query_params)
     qs = '&'.join(f'{k}={v}' for k, v in params.items())
-    ws_url = f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+    agent_ws_url = f"{_to_ws(base_url)}/sockets/events/{real_id}"
     if qs:
-        ws_url += f'?{qs}'
+        agent_ws_url += f'?{qs}'
     try:
-        async with websockets.connect(ws_url) as agent_ws:
+        async with websockets.connect(agent_ws_url) as agent_ws:
             async def c2a():
                 try:
                     while True:
@@ -310,7 +394,7 @@ async def proxy_websocket(websocket: WebSocket, conversation_id: str):
             pass
 
 
-# ── POST events：旧 action 格式转换为 agent-server v1.10.0-python SDK 格式后 HTTP POST ──
+# -- POST events: convert old action format to SDK SendMessageRequest --
 def _convert_action_to_sdk_message(body: bytes) -> bytes:
     """Convert old OpenHands action format to agent-server v1.10.0-python SendMessageRequest format."""
     import json as _json
@@ -335,11 +419,12 @@ def _convert_action_to_sdk_message(body: bytes) -> bytes:
 @agent_proxy_router.post('/api/conversations/{conversation_id}/events')
 async def proxy_send_event_ws(conversation_id: str, request: Request):
     base_url = await _get_agent_server_url(conversation_id)
+    real_id = _resolve_conversation_id(conversation_id)
     params = dict(request.query_params)
     key = request.headers.get('X-Session-API-Key', '') or params.get('session_api_key', '')
     body = await request.body()
     send_body = _convert_action_to_sdk_message(body)
-    url = f'{base_url}/api/conversations/{conversation_id}/events'
+    url = f'{base_url}/api/conversations/{real_id}/events'
     headers: dict = {'Content-Type': 'application/json'}
     if key:
         headers['X-Session-API-Key'] = key
@@ -351,10 +436,9 @@ async def proxy_send_event_ws(conversation_id: str, request: Request):
     return Response(content='{"success":true}', status_code=200, media_type='application/json')
 
 
-# ── HTTP catch-all 代理 ──
+# -- HTTP catch-all proxy --
 @agent_proxy_router.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
 async def proxy_http(request: Request, path: str):
-    # Extract conversation_id from path if present
     m = re.search(r'conversations/([a-f0-9]{32})', path)
     conv_id = m.group(1) if m else None
     base_url = await _get_agent_server_url(conv_id) if conv_id else 'http://127.0.0.1:8000'
@@ -362,6 +446,10 @@ async def proxy_http(request: Request, path: str):
     params = dict(request.query_params)
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ('host', 'content-length', 'transfer-encoding', 'connection')}
+    if 'x-session-api-key' not in {k.lower() for k in headers} and 'session_api_key' not in params:
+        _key = _get_agent_server_key()
+        if _key:
+            headers['X-Session-API-Key'] = _key
     body = await request.body()
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -658,7 +746,7 @@ import re as _re
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if 'agent_server_proxy' in src and 'api/proxy/events' in src and '_convert_action_to_sdk_message_bridge' in src and 'heartbeat' in src:
+if 'agent_server_proxy' in src and 'api/proxy/events' in src and '_resolve_conversation_id' in src and 'heartbeat' in src:
     print('app.py 所有路由（含 heartbeat）已存在 ✓')
     exit(0)
 
@@ -682,7 +770,7 @@ if MARKER not in src:
     exit(1)
 
 # 注入 /api/proxy/events SSE + send 路由（动态 URL + heartbeat）
-if 'api/proxy/events' not in src or '_convert_action_to_sdk_message_bridge' not in src or 'heartbeat' not in src:
+if 'api/proxy/events' not in src or '_resolve_conversation_id' not in src or 'heartbeat' not in src:
     # Remove old injection if present (missing heartbeat)
     if 'api/proxy/events' in src and 'heartbeat' not in src:
         src = _re.sub(
@@ -699,15 +787,14 @@ if 'api/proxy/events' not in src or '_convert_action_to_sdk_message_bridge' not 
     new_routes = '''
 @app.get("/api/proxy/events/{conversation_id}/stream", include_in_schema=False)
 async def api_proxy_events_stream(request: Request, conversation_id: str):
-    """SSE via /api/* - klogin只转发/api/*，此端点让浏览器收到V1实时事件。
-    Bridge mode: uses _get_agent_server_url() to dynamically resolve per-conversation WS URL."""
     import websockets as _ws
     from starlette.responses import StreamingResponse as _SR
-    from openhands.server.routes.agent_server_proxy import _get_agent_server_url, _to_ws
+    from openhands.server.routes.agent_server_proxy import _get_agent_server_url, _to_ws, _resolve_conversation_id
     params = dict(request.query_params)
     qs = "&".join(f"{k}={v}" for k, v in params.items())
     base_url = await _get_agent_server_url(conversation_id)
-    ws_url = f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+    real_conv_id = _resolve_conversation_id(conversation_id)
+    ws_url = f"{_to_ws(base_url)}/sockets/events/{real_conv_id}"
     if qs:
         ws_url += f"?{qs}"
     async def _gen():
@@ -717,7 +804,7 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
         _base_qs = "&".join(f"{k}={v}" for k, v in params.items() if k != "resend_all")
         while True:
             try:
-                _url = ws_url if first else f"{_to_ws(base_url)}/sockets/events/{conversation_id}"
+                _url = ws_url if first else f"{_to_ws(base_url)}/sockets/events/{real_conv_id}"
                 if not first and _base_qs:
                     _url += f"?{_base_qs}"
                 async with _ws.connect(_url) as ws:
@@ -737,7 +824,6 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 def _convert_action_to_sdk_message_bridge(body: bytes) -> bytes:
-    """Convert old OpenHands action format to agent-server v1.10.0-python SendMessageRequest format."""
     import json as _json
     try:
         data = _json.loads(body)
@@ -759,12 +845,13 @@ def _convert_action_to_sdk_message_bridge(body: bytes) -> bytes:
 @app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)
 async def api_proxy_send_event(conversation_id: str, request: Request):
     # Bridge mode: convert action format + HTTP POST to per-conversation agent-server URL.
-    from openhands.server.routes.agent_server_proxy import _get_agent_server_url
+    from openhands.server.routes.agent_server_proxy import _get_agent_server_url, _resolve_conversation_id
     body = await request.body()
     key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")
     send_body = _convert_action_to_sdk_message_bridge(body)
     base_url = await _get_agent_server_url(conversation_id)
-    url = f"{base_url}/api/conversations/{conversation_id}/events"
+    real_id = _resolve_conversation_id(conversation_id)
+    url = f"{base_url}/api/conversations/{real_id}/events"
     headers = {"Content-Type": "application/json"}
     if key:
         headers["X-Session-API-Key"] = key
