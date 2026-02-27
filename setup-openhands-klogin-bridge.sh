@@ -1128,9 +1128,14 @@ sudo docker cp /tmp/bridge_patch_per_conv_workspace.py openhands-app-bridge:/tmp
 sudo docker exec openhands-app-bridge python3 /tmp/bridge_patch_per_conv_workspace.py
 
 # ─────────────────────────────────────────────────────────────
-# bridge-P9：sandbox port proxy（Code/App tab 浏览器访问）
-# VSCode (8001), App 预览 (8011/8012) 的 URL 是 http://127.0.0.1:{port}，
-# 在 openhands-app-bridge 注入 /api/sandbox-port/{port}/* 代理路由。
+# bridge-P9：sandbox port proxy（Code/App tab + 用户 app 分享）
+# Bridge mode 网络拓扑与 klogin-deploy（host network）不同：
+#   - VSCode/App 固定端口(8001/8011/8012)发布到宿主机随机端口，
+#     bridge-P10 把 exposed_url.port 改为宿主机端口，所以 127.0.0.1:{port} 可达。
+#   - 用户自启 app（如 8506）只在容器内部，宿主机不可达。
+#     → _find_bridge_target() 先试 127.0.0.1:{port}，失败则扫描 oh-bridge-*
+#       容器找监听该端口的容器 IP，用 http://{container_ip}:{port}。
+# 用户 app 分享 URL：https://openhands-bridge.svc.{INSTANCE}.../api/sandbox-port/{port}/
 # ─────────────────────────────────────────────────────────────
 cat > /tmp/bridge_patch_sandbox_port_proxy.py << 'PYEOF'
 """Patch 9: Add /api/sandbox-port/{port}/{path} reverse proxy for VSCode/App tabs."""
@@ -1138,9 +1143,14 @@ path = '/app/openhands/server/app.py'
 with open(path) as f:
     src = f.read()
 
-if 'sandbox-port' in src:
-    print('sandbox-port 代理路由已存在 ✓')
+if 'sandbox-port' in src and '_find_bridge_target' in src:
+    print('sandbox-port 代理路由（含 bridge 容器 IP 查找）已存在 ✓')
     exit(0)
+if 'sandbox-port' in src:
+    import re as _re2
+    src = _re2.sub(r'\n# --- Sandbox port proxy.*?# --- End sandbox port proxy ---\n',
+                   '\n', src, flags=_re2.DOTALL)
+    print('旧 sandbox-port 路由已移除（重新注入含 bridge 容器 IP 查找）')
 
 MARKER = 'app.include_router(agent_proxy_router)'
 if MARKER not in src:
@@ -1149,13 +1159,62 @@ if MARKER not in src:
 
 PROXY_ROUTES = '''
 
-# --- Sandbox port proxy: VSCode (8001), App (8011/8012) ---
+# --- Sandbox port proxy: VSCode (8001), App (8011/8012), user apps (8500+) ---
+# Bridge mode: VSCode/App published ports reachable via 127.0.0.1:{host_port} (set by bridge-P10).
+# User apps (e.g. 8506) run only inside the sandbox container -- not published to host.
+# _find_bridge_target() probes 127.0.0.1:{port} first; on failure scans oh-bridge-* containers
+# for the one listening on that port and returns its container IP.
+import asyncio as _aio
+import subprocess as _sp
+
+async def _find_bridge_target(port: int) -> str:
+    """Return the reachable base URL for a sandbox port in bridge mode.
+
+    1. Try 127.0.0.1:{port} (works for published ports like VSCode/App).
+    2. On failure, scan oh-bridge-* containers for one that exposes {port}
+       on its container IP (user apps not published to host).
+    3. Fall back to 127.0.0.1:{port} if scan fails.
+    """
+    import httpx as _hx
+    try:
+        async with _hx.AsyncClient(timeout=1.0) as _c:
+            await _c.get(f"http://127.0.0.1:{port}/")
+        return f"http://127.0.0.1:{port}"
+    except Exception:
+        pass
+    try:
+        result = await _aio.to_thread(
+            _sp.run,
+            ["docker", "ps", "--filter", "name=oh-bridge-", "--format",
+             "{{.Names}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) < 2:
+                continue
+            cname, ports_str = parts[0], parts[1]
+            if f"->{port}/" in ports_str or f":{port}/" in ports_str:
+                ip_result = await _aio.to_thread(
+                    _sp.run,
+                    ["docker", "inspect", "--format",
+                     "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", cname],
+                    capture_output=True, text=True, timeout=5
+                )
+                cip = ip_result.stdout.strip()
+                if cip:
+                    return f"http://{cip}:{port}"
+    except Exception:
+        pass
+    return f"http://127.0.0.1:{port}"
+
 from fastapi import WebSocket as _FastAPIWebSocket
 @app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
 async def sandbox_port_proxy(port: int, path: str, request: Request):
     """Reverse proxy any sandbox port through openhands-app-bridge (port 3002)."""
     import httpx as _hx, re as _re
-    target = f"http://127.0.0.1:{port}/{path}"
+    base = await _find_bridge_target(port)
+    target = f"{base}/{path}"
     qs = str(request.query_params)
     if qs:
         target += f"?{qs}"
@@ -1221,12 +1280,13 @@ async def sandbox_port_ws_proxy(port: int, path: str, websocket: _FastAPIWebSock
     import websockets as _ws
     await websocket.accept()
     qs = str(websocket.query_params)
-    ws_url = f"ws://127.0.0.1:{port}/{path}"
+    base = await _find_bridge_target(port)
+    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+    ws_url = f"{ws_base}/{path}"
     if qs:
         ws_url += f"?{qs}"
     try:
         async with _ws.connect(ws_url) as target_ws:
-            import asyncio
             async def client_to_target():
                 try:
                     while True:
@@ -1246,10 +1306,10 @@ async def sandbox_port_ws_proxy(port: int, path: str, websocket: _FastAPIWebSock
                             await websocket.send_text(msg)
                 except Exception:
                     pass
-            done, pending = await asyncio.wait(
-                [asyncio.create_task(client_to_target()),
-                 asyncio.create_task(target_to_client())],
-                return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await _aio.wait(
+                [_aio.create_task(client_to_target()),
+                 _aio.create_task(target_to_client())],
+                return_when=_aio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
     except Exception:
