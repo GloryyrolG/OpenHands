@@ -178,6 +178,34 @@ klogin ingresses create openhands --instance <instance-id> --port 3000 --access-
 
 > `--access-control=false`：跳过 klogin 的 AppleConnect OAuth 代理，由 OpenHands 自己负责认证。避免双重 auth 干扰（klogin OAuth 会拦截 cookie/header，导致 OpenHands 登录异常）。
 
+### Agent 启动的 App 分享给同事（Streamlit / Gradio 等）
+
+`/api/sandbox-port/` 代理对 WebSocket 密集型 app（如 Streamlit）不可靠（klogin 剥离 WS Upgrade 头）。
+**正确方案：klogin ingress 直连端口。**
+
+**一次性准备**（预留端口池 8500–8509）：
+
+```bash
+# 开放防火墙
+ssh <instance-id> "sudo ufw allow 8500:8509/tcp"
+
+# 批量创建 ingress（本地运行）
+for port in $(seq 8500 8509); do
+  klogin ingresses create app${port} \
+    --instance <instance-id> \
+    --port ${port} \
+    --access-control=false \
+    -I
+done
+```
+
+访问地址格式：`https://app8501.svc.<instance-id>.klogin-user.mlplatform.apple.com`
+
+**使用方式**：让 agent 把 app 启动在 8500–8509 中任意一个端口，把对应 URL 发给同事即可。
+需要换 app 时，停掉旧进程，在同一端口启新 app，URL 不变。
+
+> **注意**：UFW 必须提前开放对应端口，否则 klogin health probe 探活失败，ingress 显示 `READY=false`，访问返回 503。
+
 创建后域名固定为：
 
 ```
