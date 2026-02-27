@@ -947,6 +947,58 @@ PYEOF
 sudo docker cp /tmp/bridge-index.html openhands-app-bridge:/app/frontend/build/index.html
 
 # ─────────────────────────────────────────────────────────────
+# bridge-P7c：index.html task-nav-fix
+#   监控 pushState 到 /conversations/task-xxx，
+#   poll READY 后 replaceState+popstate 到真实 app_conversation_id
+# ─────────────────────────────────────────────────────────────
+cat > /tmp/bridge_patch_task_nav_fix.py << 'PYEOF'
+TARGET = '/app/frontend/build/index.html'
+with open(TARGET) as f:
+    src = f.read()
+
+if 'task-nav-fix' in src:
+    print('task-nav-fix 已存在 ✓')
+    exit(0)
+
+TASK_NAV_FIX = '''<script id="task-nav-fix">
+(function(){
+var _push=history.pushState.bind(history);
+history.pushState=function(state,title,url){
+  _push(state,title,url);
+  if(url&&typeof url==='string'&&url.indexOf('/conversations/task-')>=0){
+    var taskId=url.split('/conversations/task-')[1].split('?')[0];
+    var attempts=0;
+    function poll(){
+      if(attempts++>40)return;
+      fetch('/api/v1/start-tasks/'+taskId)
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var appId=d&&(d.app_conversation_id||d.conversation_id);
+          if(appId&&d.status==='READY'){
+            var newUrl='/conversations/'+appId;
+            history.replaceState({},'',newUrl);
+            window.dispatchEvent(new PopStateEvent('popstate',{state:{}}));
+          } else {
+            setTimeout(poll,2000);
+          }
+        })
+        .catch(function(){setTimeout(poll,2000);});
+    }
+    setTimeout(poll,1000);
+  }
+};
+})();
+</script>'''
+
+new_src = src.replace('</head>', TASK_NAV_FIX + '\n</head>', 1)
+with open(TARGET, 'w') as f:
+    f.write(new_src)
+print('task-nav-fix 已注入 index.html ✓')
+PYEOF
+sudo docker cp /tmp/bridge_patch_task_nav_fix.py openhands-app-bridge:/tmp/
+sudo docker exec openhands-app-bridge python3 /tmp/bridge_patch_task_nav_fix.py
+
+# ─────────────────────────────────────────────────────────────
 # bridge-P8：per-conversation workspace 隔离
 # Bridge mode 每会话已有独立 sandbox 容器，但 working_dir 仍需隔离。
 # ─────────────────────────────────────────────────────────────
