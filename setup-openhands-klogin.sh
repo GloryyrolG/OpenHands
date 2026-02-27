@@ -44,6 +44,10 @@ if ! sudo docker info &>/dev/null 2>&1; then
 fi
 echo "Docker 已安装 ✓"
 
+# 开放防火墙端口（ingress 直连模式需要）
+sudo ufw allow 3000
+echo "ufw allow 3000 ✓"
+
 # 配置 host.docker.internal（必须用 hostname -I，不能用 ifconfig.me）
 EXTERNAL_IP=$(hostname -I | awk '{print $1}')
 echo "实例 IP: $EXTERNAL_IP"
@@ -1143,7 +1147,17 @@ INNEREOF
 sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html 2>/dev/null || true
 REMOTE
 
-# 4. 建立本地 SSH 隧道并验证
+# 4. 配置 klogin ingress（域名访问，只需运行一次）
+echo ""
+echo ">>> 配置 klogin ingress..."
+# 确保实例有静态 IP（ingress 必需）
+klogin instances update "$INSTANCE_ID" --static-ip 2>/dev/null && echo "静态 IP 已设置 ✓" || echo "静态 IP 已存在或设置失败（可忽略）"
+# 创建 ingress（已存在则跳过）
+klogin ingresses create openhands --instance "$INSTANCE_ID" --port 3000 --access-control=false 2>/dev/null \
+  && echo "ingress 创建成功 ✓" \
+  || echo "ingress 已存在或创建失败（可忽略，域名: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com）"
+
+# 5. 建立本地 SSH 隧道并验证
 echo ""
 echo ">>> 建立本地隧道并验证..."
 pkill -f "ssh.*-L 3001.*$INSTANCE_ID" 2>/dev/null || true

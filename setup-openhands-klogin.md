@@ -166,10 +166,13 @@ sudo docker run -d --pull=always \
 首次使用需在**本地**创建 ingress（只需运行一次）：
 
 ```bash
-# 1. 在 klogin 实例上开放防火墙端口
+# 1. 设置静态 IP（ingress 要求）
+klogin instances update <instance-id> --static-ip
+
+# 2. 在 klogin 实例上开放防火墙端口
 ssh <instance-id> "sudo ufw allow 3000"
 
-# 2. 在本地创建 ingress，禁用 klogin OAuth 层（OpenHands 自带鉴权）
+# 3. 在本地创建 ingress，禁用 klogin OAuth 层（OpenHands 自带鉴权）
 klogin ingresses create openhands --instance <instance-id> --port 3000 --access-control=false
 ```
 
