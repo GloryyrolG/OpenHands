@@ -196,6 +196,7 @@ import websockets
 import subprocess as _sp
 import functools as _ft
 import sqlite3 as _sqlite3
+import uuid as _uuid
 from fastapi import APIRouter, Request, WebSocket, Response
 from starlette.responses import StreamingResponse
 
@@ -248,8 +249,18 @@ def _resolve_id_via_db(raw_id: str) -> str:
     return ''
 
 
+def _hex_to_uuid(hex_id: str) -> str:
+    """Convert hex conversation ID (with or without dashes) to UUID format with dashes.
+    Agent-server Go binary uses UUID format; bare hex causes WS timeout."""
+    try:
+        return str(_uuid.UUID(hex_id))
+    except Exception:
+        return hex_id
+
+
 def _resolve_conversation_id(raw_id: str) -> str:
-    """Resolve task-xxx or V1 task ID -> real app_conversation_id."""
+    """Resolve task-xxx or V1 task ID -> real app_conversation_id in UUID format.
+    Always returns UUID-with-dashes so agent-server WS/HTTP work correctly."""
     if raw_id in _conv_id_cache:
         return _conv_id_cache[raw_id]
     clean = raw_id.removeprefix('task-')
@@ -263,14 +274,16 @@ def _resolve_conversation_id(raw_id: str) -> str:
         row = cur.fetchone()
         conn.close()
         if row and row[0]:
-            result = row[0]
+            result = _hex_to_uuid(row[0])  # Always UUID format for agent-server
             _conv_id_cache[raw_id] = result
             _conv_id_cache[clean] = result
             return result
     except Exception:
         pass
-    _conv_id_cache[raw_id] = clean
-    return clean
+    # Input might itself be app_conversation_id (hex without dashes); convert to UUID format
+    result = _hex_to_uuid(clean)
+    _conv_id_cache[raw_id] = result
+    return result
 
 
 async def _get_agent_server_url(conversation_id: str) -> str:
