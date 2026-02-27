@@ -166,8 +166,14 @@ sudo docker run -d --pull=always \
 首次使用需在**本地**创建 ingress（只需运行一次）：
 
 ```bash
-klogin ingresses create openhands --instance <instance-id> --port 3000
+# 1. 在 klogin 实例上开放防火墙端口
+ssh <instance-id> "sudo ufw allow 3000"
+
+# 2. 在本地创建 ingress，禁用 klogin OAuth 层（OpenHands 自带鉴权）
+klogin ingresses create openhands --instance <instance-id> --port 3000 --access-control=false
 ```
+
+> `--access-control=false`：跳过 klogin 的 AppleConnect OAuth 代理，由 OpenHands 自己负责认证。避免双重 auth 干扰（klogin OAuth 会拦截 cookie/header，导致 OpenHands 登录异常）。
 
 创建后域名固定为：
 
