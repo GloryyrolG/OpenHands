@@ -57,6 +57,7 @@ bash setup-openhands-klogin-{variant}.sh
 | 2b | rate limiter 修复 | `middleware.py` | klogin 共享 IP + SSE 重连风暴导致全局 429；SSE 排除限流 + X-Forwarded-For |
 | 9 | sandbox port proxy | `app.py` | 注入 `/api/sandbox-port/{port}/*` 反代，让浏览器访问 VSCode/App tab |
 | 10 | exposed_urls 重写 | `docker_sandbox_service.py` | VSCODE/WORKER URL 改为 `/api/sandbox-port/{port}`；AGENT_SERVER 保持绝对 URL |
+| 11 | vscode-tab URL parse fix + cache bust | `vscode-tab-*.js`（z-suffix 新文件） | `new URL(relativeUrl)` 抛 TypeError → 改为 `new URL(url, window.location.origin)`；z-suffix 绕过 30d immutable 缓存 |
 
 ### 补丁8 详细说明：Per-Conversation 工作目录隔离
 
@@ -66,24 +67,28 @@ bash setup-openhands-klogin-{variant}.sh
 
 **效果**：软隔离——每个会话默认在自己目录工作，技术上仍可 `cd ..` 看到其他会话（同一 Linux 用户）。
 
-### 补丁9+10 详细说明：Code/App tab 访问（sandbox port proxy）
+### 补丁9+10+11 详细说明：Code/App tab 访问（sandbox port proxy）
 
 **问题**：OpenHands 侧边栏的 Code tab（VSCode 编辑器）和 App tab（应用预览）通过 `exposed_urls` 中的 `http://127.0.0.1:{port}` URL 打开 iframe。klogin 用户的浏览器无法直接访问远程机器的 127.0.0.1，导致这些 tab 显示空白或报错。
 
 **方案**：
-- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由，作为 HTTP/WebSocket 反向代理。浏览器请求经 klogin → openhands-app（`{APP_PORT}` 端口）→ 转发到容器内 `http://127.0.0.1:{port}`。
-- **补丁10**：在 `_container_to_sandbox_info()` 中，返回 `SandboxInfo` 前将 VSCODE/WORKER 的 `exposed_urls` 从 `http://127.0.0.1:{port}` 改写为 `/api/sandbox-port/{port}`。AGENT_SERVER URL 保持绝对路径不变（`_container_to_checked_sandbox_info()` health check 需要）。
+- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由，作为 HTTP/WebSocket 反向代理。浏览器请求经 klogin → openhands-app（`{APP_PORT}` 端口）→ 转发到目标服务。
+  - **bridge-mode 专属**：固定端口（VSCode/App 8001/8011/8012）由 bridge-P10 改写为宿主机映射端口，`127.0.0.1:{host_port}` 可达；用户自启 app（如 8506）仅在容器内，`_find_bridge_target(port)` 先探测 `127.0.0.1:{port}`，失败则扫描 `oh-bridge-*` 容器找对应容器 IP，使用 `http://{container_ip}:{port}` 转发。
+  - **klogin-deploy**（host network）：所有端口直接 `127.0.0.1:{port}` 可达。
+- **补丁10**：在 `_container_to_sandbox_info()` 中，返回 `SandboxInfo` 前将 VSCODE/WORKER 的 `exposed_urls` 从 `http://127.0.0.1:{port}` 改写为 `/api/sandbox-port/{port}`（相对路径）。AGENT_SERVER URL 保持绝对路径不变（health check 需要）。
+  - 改写为相对路径还解决了「跨域 Cookie 警告」：`new URL('/api/sandbox-port/...', window.location.origin).protocol` 与页面 `https:` 一致，不再触发协议不匹配判断。
+- **补丁11**：`vscode-tab-*.js` 中 `new URL(r.url)` 对相对 URL 会抛 TypeError（无 base）→ 改为 `new URL(r.url, window.location.origin)`。同时以 z-suffix 重命名新文件绕过浏览器 30d `immutable` 缓存。
 
 **验证**：
 ```bash
 # sandbox port proxy 是否存在（需要 sandbox 在运行中）
-curl -s http://localhost:{TUNNEL_PORT}/api/sandbox-port/8001/?tkn=<session_api_key>&folder=/workspace/project
+curl -s "http://localhost:{TUNNEL_PORT}/api/sandbox-port/8001/?tkn=<session_api_key>&folder=/workspace/project"
 # → 应返回 200 OK + VSCode HTML
 
 # exposed_urls 是否正确重写
 curl -s "http://localhost:{TUNNEL_PORT}/api/v1/sandboxes?id=<sandbox_id>" | python3 -m json.tool
-# VSCODE.url 应为 /api/sandbox-port/8001/...（不是 http://127.0.0.1:8001）
-# AGENT_SERVER.url 应为 http://127.0.0.1:8000（保持绝对路径）
+# VSCODE.url 应为 /api/sandbox-port/{host_port}/...（相对路径，不是 http://127.0.0.1:...）
+# AGENT_SERVER.url 应为 http://127.0.0.1:{port}（保持绝对路径）
 ```
 
 ---
@@ -189,8 +194,11 @@ https://{INGRESS_NAME}.svc.<instance-id>.klogin-user.mlplatform.apple.com
 
 ### Agent 启动的 App 分享给同事（Streamlit / Gradio 等）
 
-`/api/sandbox-port/` 代理对 WebSocket 密集型 app（如 Streamlit）不可靠（klogin 剥离 WS Upgrade 头）。
-**正确方案：klogin ingress 直连端口。**
+分享方案因分支（网络模式）而异：
+
+#### klogin-deploy（host network）
+
+sandbox 端口直接暴露在宿主机，可用 klogin ingress 直连。`/api/sandbox-port/` 对 WebSocket 密集型 app 不可靠（klogin 剥离 WS Upgrade 头），推荐 ingress 方案。
 
 **一次性准备**（预留端口池 8500–8509）：
 
@@ -214,6 +222,24 @@ done
 需要换 app 时，停掉旧进程，在同一端口启新 app，URL 不变。
 
 > **注意**：UFW 必须提前开放对应端口，否则 klogin health probe 探活失败，ingress 显示 `READY=false`，访问返回 503。
+
+#### bridge-mode（bridge network）
+
+sandbox 容器运行在 Docker bridge 网络，用户 app 端口**不发布到宿主机**，klogin ingress 直连不可用。
+**正确方案**：通过 `/api/sandbox-port/{port}/` 路由访问，bridge-P9 的 `_find_bridge_target()` 会自动扫描容器 IP 转发。
+
+```
+浏览器 → openhands-bridge ingress → /api/sandbox-port/{port}/ → 容器 IP:{port}
+```
+
+访问地址格式：
+```
+https://{INGRESS_NAME}.svc.<instance-id>.klogin-user.mlplatform.apple.com/api/sandbox-port/{port}/
+```
+
+**使用方式**：让 agent 把 app 启动在任意端口（如 8506），分享上述 URL 即可。无需预留端口池或创建额外 ingress。
+
+> **注意**：klogin 剥离 WS Upgrade 头，WebSocket 密集型 app（如原生 Streamlit）可能功能受限。Gradio / HTTP-only app 可正常使用。
 
 ### SSH 本地隧道
 
@@ -254,6 +280,29 @@ sudo docker logs {CONTAINER} --tail 50
 AGENT=$(sudo docker ps --filter name={AGENT_PREFIX} -q | head -1)
 sudo docker logs $AGENT --tail 50
 ```
+
+### Code tab 显示「跨域 Cookie 错误」
+
+> "The code editor cannot be embedded due to browser security restrictions. Cross-origin cookies are being blocked."
+
+**根因**：`exposed_urls` 中 VSCODE 的 URL 仍为 `http://127.0.0.1:{port}`（HTTP 协议）。vscode-tab 组件检测到 URL 协议（`http:`）与页面协议（`https:`）不匹配，触发跨域警告。
+
+**修复**：确保补丁9、10、11 均已应用。
+
+```bash
+# 检查 exposed_urls 是否已重写（URL 应为相对路径，不含 http://）
+curl -s "http://localhost:{TUNNEL_PORT}/api/v1/sandboxes?id=<sandbox_id>" | python3 -c "
+import sys, json
+sandboxes = json.load(sys.stdin)
+for eu in (sandboxes[0].get('exposed_urls') or []):
+    print(eu['name'], eu['url'][:60])
+"
+# VSCODE 应显示 /api/sandbox-port/...（相对路径）
+
+# 若补丁未应用，重新运行 setup 脚本后 docker restart {CONTAINER}
+```
+
+还需强制刷新浏览器（Cmd+Shift+R）清除旧缓存的 JS 文件。
 
 ### 验证 per-conversation 目录隔离
 
