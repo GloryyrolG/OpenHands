@@ -163,6 +163,14 @@ sudo docker run -d --pull=always \
 
 ### 域名（推荐，同事直接用）
 
+首次使用需在**本地**创建 ingress（只需运行一次）：
+
+```bash
+klogin ingresses create openhands --instance <instance-id> --port 3000
+```
+
+创建后域名固定为：
+
 ```
 https://openhands.svc.<instance-id>.klogin-user.mlplatform.apple.com
 ```
