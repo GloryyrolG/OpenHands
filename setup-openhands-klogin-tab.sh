@@ -55,6 +55,40 @@ sudo sed -i '/host.docker.internal/d' /etc/hosts
 echo "$EXTERNAL_IP host.docker.internal" | sudo tee -a /etc/hosts
 echo "hosts 配置完成 ✓"
 
+# 创建独立 settings 目录（与 klogin-deploy 完全隔离）
+mkdir -p ~/.openhands-tab
+
+# 从主实例 settings 复制 LLM 配置（只改 base_url 用 host.docker.internal）
+CURRENT_MODEL=$(python3 -c "
+import json, os
+try:
+    with open(os.path.expanduser('~/.openhands/settings.json')) as f:
+        d = json.load(f)
+    print(d.get('llm_model', 'openai/gemini-3-pro-preview'))
+except: print('openai/gemini-3-pro-preview')
+" 2>/dev/null)
+CURRENT_APIKEY=$(python3 -c "
+import json, os
+try:
+    with open(os.path.expanduser('~/.openhands/settings.json')) as f:
+        d = json.load(f)
+    print(d.get('llm_api_key', 'dummy-key'))
+except: print('dummy-key')
+" 2>/dev/null)
+MODEL_SLUG=$(echo "$CURRENT_MODEL" | sed 's|.*/||')
+
+cat > ~/.openhands-tab/settings.json << EOF
+{
+  "llm_model": "$CURRENT_MODEL",
+  "llm_api_key": "$CURRENT_APIKEY",
+  "llm_base_url": "http://host.docker.internal:8881/llm/$MODEL_SLUG/v1",
+  "agent": "CodeActAgent",
+  "language": "en",
+  "enable_default_condenser": true
+}
+EOF
+echo "settings.json 已创建（LLM: $CURRENT_MODEL via host.docker.internal）✓"
+
 # 清理旧 agent-server 和主容器（防止 401 认证冲突）
 sudo docker ps -a --filter name=oh-tab- -q | xargs -r sudo docker rm -f 2>/dev/null || true
 sudo docker rm -f openhands-app-tab 2>/dev/null || true
@@ -64,6 +98,7 @@ echo ">>> 启动 OpenHands..."
 sudo docker run -d --pull=always \
   --name openhands-app-tab \
   --network host \
+  -e SANDBOX_USER_ID=0 \
   -e AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server \
   -e AGENT_SERVER_IMAGE_TAG=1.10.0-python \
   -e LOG_ALL_EVENTS=true \
@@ -75,8 +110,9 @@ sudo docker run -d --pull=always \
   -e OH_WEB_URL='http://127.0.0.1:3003' \
   -e ENABLE_MCP=false \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/.openhands:/.openhands \
-  docker.openhands.dev/openhands/openhands:1.3
+  -v ~/.openhands-tab:/.openhands \
+  docker.openhands.dev/openhands/openhands:1.3 \
+  uvicorn openhands.server.listen:app --host 0.0.0.0 --port 3003
 
 # 等待启动
 echo "等待 OpenHands 启动..."
@@ -97,28 +133,57 @@ path = '/app/openhands/app_server/sandbox/docker_sandbox_service.py'
 with open(path) as f:
     src = f.read()
 
-if 'Reusing existing sandbox in host network mode' in src:
+if '[OH-TAB] bridge mode' in src:
     print('sandbox 补丁已存在 ✓')
     exit(0)
 
-old = '        """Start a new sandbox."""\n        # Warn about port collision risk'
-new_code = '''        """Start a new sandbox."""
-        # In host network mode, only one container can bind to a given port.
-        # Reuse an existing running sandbox to avoid session key mismatch (401).
-        if self.use_host_network:
+# Part 1: reuse existing RUNNING oh-tab- sandbox (avoid 401 from key mismatch)
+old_reuse = '        """Start a new sandbox."""\n        # Warn about port collision risk'
+new_reuse = '''        """Start a new sandbox."""
+        # OH-TAB: reuse existing RUNNING sandbox to avoid starting multiple containers
+        if self.container_name_prefix == 'oh-tab-':
+            existing_page = await self.search_sandboxes()
+            for item in existing_page.items:
+                if item.status == SandboxStatus.RUNNING:
+                    _logger.info(f'[OH-TAB] Reusing existing sandbox: {item.id}')
+                    return item
+        elif self.use_host_network:
             existing_page = await self.search_sandboxes()
             for item in existing_page.items:
                 if item.status == SandboxStatus.RUNNING:
                     _logger.info(f'Reusing existing sandbox in host network mode: {item.id}')
                     return item
         # Warn about port collision risk'''
-if old in src:
-    src = src.replace(old, new_code, 1)
-    with open(path, 'w') as f:
-        f.write(src)
-    print('sandbox 补丁已应用（host network 复用 sandbox）✓')
+if old_reuse in src:
+    src = src.replace(old_reuse, new_reuse, 1)
+    print('sandbox 复用补丁已应用（host network 复用 sandbox）✓')
 else:
-    print('警告: sandbox 补丁 pattern 未匹配，跳过')
+    print('警告: sandbox 复用补丁 pattern 未匹配，跳过')
+
+# Part 2: force bridge mode for oh-tab- to avoid port 8000 conflict with other deployments
+old_net = '        # Determine network mode\n        network_mode = \'host\' if self.use_host_network else None\n\n        if self.use_host_network:'
+new_net = '''        # Determine network mode
+        network_mode = 'host' if self.use_host_network else None
+
+        # [OH-TAB] bridge mode: avoid port 8000 conflict with other openhands deployments
+        if self.container_name_prefix == 'oh-tab-':
+            network_mode = None  # bridge mode
+            port_mappings = {}
+            for exposed_port in self.exposed_ports:
+                host_port = self._find_unused_port()
+                port_mappings[exposed_port.container_port] = host_port
+                env_vars[exposed_port.name] = str(host_port)
+                _logger.info(f'[OH-TAB] bridge mode: container port {exposed_port.container_port} -> host port {host_port}')
+
+        if self.use_host_network and self.container_name_prefix != 'oh-tab-':'''
+if old_net in src:
+    src = src.replace(old_net, new_net, 1)
+    print('sandbox bridge-mode 补丁已应用（oh-tab- 使用 bridge 避免 port 8000 冲突）✓')
+else:
+    print('警告: sandbox bridge-mode 补丁 pattern 未匹配，跳过')
+
+with open(path, 'w') as f:
+    f.write(src)
 
 # 修改 agent-server 容器前缀，避免与其他 openhands 实例冲突
 prefix_old = "container_name_prefix: str = 'oh-agent-server-'"
@@ -138,6 +203,119 @@ PYEOF
 sudo docker cp /tmp/patch_sandbox.py openhands-app-tab:/tmp/patch_sandbox.py
 SANDBOX_RESULT=$(sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox.py 2>&1)
 echo "$SANDBOX_RESULT"
+
+# ─── 补丁1.5：bridge mode 网络修复 ───
+# 修复三个 bridge 容器网络问题：
+# (1) extra_hosts 仅在 network_mode != 'host' 时应用（不管 SANDBOX_USE_HOST_NETWORK 值）
+#     → oh-tab- 容器能解析 host.docker.internal → 172.17.0.1
+# (2) webhook URL 端口从 OH_WEB_URL 读取（避免默认 3000 与 tab-display 端口 3003 不符）
+# (3) MCP URL 替换 127.0.0.1 → host.docker.internal（bridge 容器内 127.0.0.1 是自身）
+cat > /tmp/patch_bridge_fixes.py << 'PYEOF'
+import re
+
+# Fix 1: extra_hosts condition (docker_sandbox_service.py)
+SANDBOX_PATH = '/app/openhands/app_server/sandbox/docker_sandbox_service.py'
+with open(SANDBOX_PATH) as f:
+    src = f.read()
+
+if 'network_mode != \'host\'' in src and 'OH-TAB' in src and '[OH-TAB] use network_mode check' in src:
+    print('extra_hosts fix already present ✓')
+else:
+    old_eh = (
+        "                # Allow agent-server containers to resolve host.docker.internal\n"
+        "                # and other custom hostnames for LAN deployments\n"
+        "                # Note: extra_hosts is not needed with host network mode\n"
+        "                extra_hosts=self.extra_hosts\n"
+        "                if self.extra_hosts and not self.use_host_network\n"
+        "                else None,"
+    )
+    new_eh = (
+        "                # Allow agent-server containers to resolve host.docker.internal\n"
+        "                # and other custom hostnames for LAN deployments\n"
+        "                # [OH-TAB] use network_mode check: oh-tab- forces bridge mode\n"
+        "                # even when SANDBOX_USE_HOST_NETWORK=true, so we must apply\n"
+        "                # extra_hosts for bridge-mode containers regardless of the flag\n"
+        "                extra_hosts=self.extra_hosts\n"
+        "                if self.extra_hosts and network_mode != 'host'\n"
+        "                else None,"
+    )
+    if old_eh in src:
+        src = src.replace(old_eh, new_eh, 1)
+        with open(SANDBOX_PATH, 'w') as f:
+            f.write(src)
+        print('extra_hosts fix applied ✓')
+    else:
+        print('WARNING: extra_hosts pattern not found! Check docker_sandbox_service.py')
+        idx = src.find('extra_hosts=self.extra_hosts')
+        if idx >= 0:
+            print('Context:', repr(src[max(0,idx-100):idx+200]))
+
+# Fix 2: webhook port from OH_WEB_URL (docker_sandbox_service.py)
+with open(SANDBOX_PATH) as f:
+    src = f.read()
+
+if '[OH-TAB] bridge mode: use OH_WEB_URL port for webhook' in src:
+    print('webhook port fix already present ✓')
+else:
+    old_wh = (
+        "        env_vars[WEBHOOK_CALLBACK_VARIABLE] = (\n"
+        "            f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'\n"
+        "        )"
+    )
+    new_wh = (
+        "        # [OH-TAB] bridge mode: use OH_WEB_URL port for webhook so agent-server\n"
+        "        # can call back to correct openhands app port\n"
+        "        import os as _os, re as _re\n"
+        "        _wh_port = self.host_port\n"
+        "        if self.container_name_prefix == 'oh-tab-':\n"
+        "            _web_url = _os.environ.get('OH_WEB_URL', '')\n"
+        "            _m = _re.search(r':(\\d+)$', _web_url)\n"
+        "            if _m:\n"
+        "                _wh_port = int(_m.group(1))\n"
+        "        env_vars[WEBHOOK_CALLBACK_VARIABLE] = (\n"
+        "            f'http://host.docker.internal:{_wh_port}/api/v1/webhooks'\n"
+        "        )"
+    )
+    if old_wh in src:
+        src = src.replace(old_wh, new_wh, 1)
+        with open(SANDBOX_PATH, 'w') as f:
+            f.write(src)
+        print('webhook port fix applied ✓')
+    else:
+        print('WARNING: webhook pattern not found!')
+        idx = src.find('WEBHOOK_CALLBACK_VARIABLE')
+        if idx >= 0:
+            print('Context:', repr(src[max(0,idx-20):idx+200]))
+
+# Fix 3: MCP URL replace 127.0.0.1 → host.docker.internal (live_status_app_conversation_service.py)
+LIVE_PATH = '/app/openhands/app_server/app_conversation/live_status_app_conversation_service.py'
+with open(LIVE_PATH) as f:
+    src3 = f.read()
+
+if 'host.docker.internal' in src3 and 'mcp_url' in src3:
+    print('MCP URL fix already present ✓')
+else:
+    old_mcp = "        mcp_url = f'{self.web_url}/mcp/mcp'"
+    new_mcp = (
+        "        # [OH-TAB] bridge mode: replace 127.0.0.1 with host.docker.internal so\n"
+        "        # oh-tab- containers (bridge network) can reach the openhands app MCP server\n"
+        "        mcp_url = f'{self.web_url}/mcp/mcp'.replace('http://127.0.0.1', 'http://host.docker.internal')"
+    )
+    if old_mcp in src3:
+        src3 = src3.replace(old_mcp, new_mcp, 1)
+        with open(LIVE_PATH, 'w') as f:
+            f.write(src3)
+        print('MCP URL fix applied ✓')
+    else:
+        print('WARNING: mcp_url pattern not found!')
+        idx = src3.find('mcp_url')
+        if idx >= 0:
+            print('Context:', repr(src3[max(0,idx-50):idx+150]))
+
+print('Done.')
+PYEOF
+sudo docker cp /tmp/patch_bridge_fixes.py openhands-app-tab:/tmp/patch_bridge_fixes.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_bridge_fixes.py
 
 # ─── 补丁2：agent-server 反向代理路由（修复 V1 Disconnected + 消息无响应）───
 # 问题1：V1 会话的 agent-server URL 是 http://127.0.0.1:8000，浏览器无法直接访问。
@@ -160,9 +338,6 @@ import websockets
 from fastapi import APIRouter, Request, WebSocket, Response
 from starlette.responses import StreamingResponse
 
-AGENT_SERVER_HTTP = "http://127.0.0.1:8000"
-AGENT_SERVER_WS = "ws://127.0.0.1:8000"
-
 agent_proxy_router = APIRouter(prefix="/agent-server-proxy")
 
 
@@ -174,6 +349,29 @@ class _UnixHTTPConnection(_http_client.HTTPConnection):
         s = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
         s.connect(self._socket_path)
         self.sock = s
+
+@_ft.lru_cache(maxsize=1)
+def _get_agent_server_port() -> int:
+    """Get host port mapped to container port 8000 from running oh-tab- agent-server container."""
+    try:
+        conn = _UnixHTTPConnection("/var/run/docker.sock")
+        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")
+        resp = conn.getresponse()
+        containers = _json_mod.loads(resp.read())
+        if not containers:
+            return 8000
+        for port_info in containers[0].get("Ports", []):
+            if port_info.get("PrivatePort") == 8000 and port_info.get("PublicPort"):
+                return port_info["PublicPort"]
+        return 8000
+    except Exception:
+        return 8000
+
+def _agent_http() -> str:
+    return f"http://127.0.0.1:{_get_agent_server_port()}"
+
+def _agent_ws() -> str:
+    return f"ws://127.0.0.1:{_get_agent_server_port()}"
 
 @_ft.lru_cache(maxsize=1)
 def _get_agent_server_key() -> str:
@@ -198,13 +396,39 @@ def _get_agent_server_key() -> str:
     except Exception:
         return ""
 
+_oh_tab_ip_cache = ["", 0.0]
+def _get_oh_tab_ip() -> str:
+    """Get bridge IP of running oh-tab- container (cached 60s)."""
+    import time as _t
+    if _oh_tab_ip_cache[0] and _t.time() - _oh_tab_ip_cache[1] < 60:
+        return _oh_tab_ip_cache[0]
+    try:
+        conn = _UnixHTTPConnection("/var/run/docker.sock")
+        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")
+        resp = conn.getresponse()
+        containers = _json_mod.loads(resp.read())
+        if not containers:
+            return ""
+        cid = containers[0]["Id"]
+        conn2 = _UnixHTTPConnection("/var/run/docker.sock")
+        conn2.request("GET", f"/containers/{cid}/json")
+        resp2 = conn2.getresponse()
+        cdata = _json_mod.loads(resp2.read())
+        ip = cdata.get("NetworkSettings", {}).get("IPAddress", "")
+        if ip:
+            _oh_tab_ip_cache[0] = ip
+            _oh_tab_ip_cache[1] = _t.time()
+        return ip
+    except Exception:
+        return _oh_tab_ip_cache[0]
+
 
 # SSE 端点：将 agent-server WebSocket 转为 SSE（klogin 不拦截 HTTP，会拦截 WS Upgrade）
 @agent_proxy_router.get("/sockets/events/{conversation_id}/sse")
 async def proxy_sse(request: Request, conversation_id: str):
     params = dict(request.query_params)
     qs = "&".join(f"{k}={v}" for k, v in params.items())
-    ws_url = f"{AGENT_SERVER_WS}/sockets/events/{conversation_id}"
+    ws_url = f"{_agent_ws()}/sockets/events/{conversation_id}"
     if qs:
         ws_url += f"?{qs}"
 
@@ -233,7 +457,7 @@ async def proxy_websocket(websocket: WebSocket, conversation_id: str):
     await websocket.accept()
     params = dict(websocket.query_params)
     qs = "&".join(f"{k}={v}" for k, v in params.items())
-    agent_ws_url = f"{AGENT_SERVER_WS}/sockets/events/{conversation_id}"
+    agent_ws_url = f"{_agent_ws()}/sockets/events/{conversation_id}"
     if qs:
         agent_ws_url += f"?{qs}"
     try:
@@ -274,7 +498,7 @@ async def proxy_send_event_ws(conversation_id: str, request: Request):
     params = dict(request.query_params)
     key = request.headers.get("X-Session-API-Key", "") or params.get("session_api_key", "")
     body = await request.body()
-    ws_url = f"{AGENT_SERVER_WS}/sockets/events/{conversation_id}"
+    ws_url = f"{_agent_ws()}/sockets/events/{conversation_id}"
     if key:
         ws_url += f"?session_api_key={key}"
     try:
@@ -288,7 +512,7 @@ async def proxy_send_event_ws(conversation_id: str, request: Request):
 # HTTP 代理（catch-all，必须在 SSE 路由之后注册）
 @agent_proxy_router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_http(request: Request, path: str):
-    url = f"{AGENT_SERVER_HTTP}/{path}"
+    url = f"{_agent_http()}/{path}"
     params = dict(request.query_params)
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
@@ -318,11 +542,21 @@ cat > /tmp/patch_app.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if 'agent_server_proxy' in src:
-    print('app.py 代理路由已存在 ✓')
+if 'agent_server_proxy' in src and '_gasp' in src:
+    print('app.py 代理路由（含 _gasp 动态端口）已存在 ✓')
+elif 'agent_server_proxy' in src:
+    # Upgrade: add _gasp to existing import
+    src = src.replace(
+        'from openhands.server.routes.agent_server_proxy import agent_proxy_router\n',
+        'from openhands.server.routes.agent_server_proxy import agent_proxy_router, _get_agent_server_port as _gasp\n',
+        1
+    )
+    with open('/app/openhands/server/app.py', 'w') as f:
+        f.write(src)
+    print('app.py import 升级：添加 _gasp ✓')
 else:
     old = 'from openhands.server.routes.public import app as public_api_router'
-    new = 'from openhands.server.routes.agent_server_proxy import agent_proxy_router\nfrom openhands.server.routes.public import app as public_api_router'
+    new = 'from openhands.server.routes.agent_server_proxy import agent_proxy_router, _get_agent_server_port as _gasp\nfrom openhands.server.routes.public import app as public_api_router'
     src = src.replace(old, new, 1)
     old2 = 'app.include_router(public_api_router)'
     new2 = 'app.include_router(agent_proxy_router)\napp.include_router(public_api_router)'
@@ -634,21 +868,20 @@ for js_file in sorted(glob.glob(f'{ASSETS}*.js')):
         patched_files.append(js_file)
         continue
 
-    # Find the store variable: look for screenshotSrc:"" (initial empty state)
-    idx = src.find('screenshotSrc:""')
-    if idx < 0:
-        idx = src.find("screenshotSrc:''")
+    # Find the store variable: search for setScreenshotSrc: (the setter, unique to browser store)
+    # Pattern: VAR=FUNC(e=>({...setScreenshotSrc:...}))
+    idx = src.find('setScreenshotSrc:')
     if idx < 0:
         continue
 
-    # Scan backwards up to 2000 chars for: VARNAME = FUNC(
-    prefix = src[max(0, idx - 2000):idx]
+    # Scan backwards up to 500 chars for: VARNAME = FUNC(
+    prefix = src[max(0, idx - 500):idx]
     matches = list(re.finditer(
         r'(?:^|[;{,\(\s])([A-Za-z_$][A-Za-z0-9_$]{1,20})\s*=\s*[A-Za-z_$][A-Za-z0-9_$]{1,20}\s*\(',
         prefix
     ))
     if not matches:
-        print(f'Found screenshotSrc in {os.path.basename(js_file)} but could not identify store var')
+        print(f'Found setScreenshotSrc in {os.path.basename(js_file)} but could not identify store var')
         continue
 
     store_var = matches[-1].group(1)
@@ -681,8 +914,86 @@ cat > /tmp/patch_api_proxy_events.py << 'PYEOF'
 with open('/app/openhands/server/app.py') as f:
     src = f.read()
 
-if '/api/proxy/events' in src and 'Must send via WebSocket' in src and '_AGENT_WS' not in src and 'heartbeat' in src:
-    print('api/proxy/events 路由（含WebSocket修复+heartbeat）已存在 ✓')
+if '/api/proxy/events' in src and 'httpx as _httpx, json as _json, uuid as _uuid' in src and '_gasp()' in src:
+    # HTTP POST fix already present - session_api_key injection is applied as separate patch3.5
+    print('api/proxy/events 路由（含动态端口+HTTP POST修复）已存在 ✓')
+    exit(0)
+
+if '/api/proxy/events' in src and '_gasp()' in src:
+    # Upgrade: replace WS send with HTTP POST send
+    print('升级 api_proxy_send_event 为 HTTP POST 版本...')
+    old_ws = (
+        '@app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)\n'
+        'async def api_proxy_send_event(conversation_id: str, request: Request):\n'
+        '    # Must send via WebSocket to wake up Python agent\'s asyncio queue.\n'
+        '    # HTTP POST only stores event in DB — agent won\'t see it.\n'
+        '    import websockets as _ws\n'
+        '    body = await request.body()\n'
+        '    key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")\n'
+        '    ws_url = f"ws://127.0.0.1:{_gasp()}/sockets/events/{conversation_id}"\n'
+        '    if key:\n'
+        '        ws_url += f"?session_api_key={key}"\n'
+        '    try:\n'
+        '        async with _ws.connect(ws_url) as ws:\n'
+        '            await ws.send(body.decode())\n'
+        '    except Exception:\n'
+        '        pass\n'
+        '    return JSONResponse({"success": True})'
+    )
+    new_http = (
+        '@app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)\n'
+        'async def api_proxy_send_event(conversation_id: str, request: Request):\n'
+        '    import httpx as _httpx, json as _json, uuid as _uuid\n'
+        '    body = await request.body()\n'
+        '    key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")\n'
+        '    try:\n'
+        '        conv_uuid = str(_uuid.UUID(conversation_id))\n'
+        '    except Exception:\n'
+        '        conv_uuid = conversation_id\n'
+        '    try:\n'
+        '        body_dict = _json.loads(body.decode())\n'
+        '        if \'action\' in body_dict and body_dict.get(\'action\') == \'message\':\n'
+        '            text = body_dict.get(\'args\', {}).get(\'content\', \'\')\n'
+        '            payload = {"role": "user", "content": [{"type": "text", "text": text}], "run": True}\n'
+        '        elif \'role\' in body_dict:\n'
+        '            content = body_dict.get(\'content\', \'\')\n'
+        '            if isinstance(content, str):\n'
+        '                content = [{"type": "text", "text": content}]\n'
+        '            payload = {"role": body_dict.get(\'role\', \'user\'), "content": content, "run": True}\n'
+        '        else:\n'
+        '            payload = body_dict\n'
+        '    except Exception:\n'
+        '        payload = {}\n'
+        '    try:\n'
+        '        async with _httpx.AsyncClient() as _client:\n'
+        '            await _client.post(\n'
+        '                f"http://127.0.0.1:{_gasp()}/api/conversations/{conv_uuid}/events",\n'
+        '                json=payload, headers={"X-Session-API-Key": key}, timeout=10.0)\n'
+        '    except Exception:\n'
+        '        pass\n'
+        '    return JSONResponse({"success": True})'
+    )
+    if old_ws in src:
+        src = src.replace(old_ws, new_http, 1)
+        with open('/app/openhands/server/app.py', 'w') as f:
+            f.write(src)
+        print('升级完成：api_proxy_send_event WS → HTTP POST ✓')
+    else:
+        print('WARNING: WS send pattern not found for upgrade')
+    exit(0)
+
+if '/api/proxy/events' in src and 'Must send via WebSocket' in src and 'heartbeat' in src:
+    # Upgrade: replace hardcoded port with dynamic _gasp() call
+    print('升级 api/proxy/events 路由至动态端口版本...')
+    src = src.replace(
+        'from openhands.server.routes.agent_server_proxy import agent_proxy_router\n',
+        'from openhands.server.routes.agent_server_proxy import agent_proxy_router, _get_agent_server_port as _gasp\n',
+        1
+    )
+    src = src.replace('ws://127.0.0.1:8000/sockets/events/', 'ws://127.0.0.1:{_gasp()}/sockets/events/')
+    with open('/app/openhands/server/app.py', 'w') as f:
+        f.write(src)
+    print('升级完成：hardcoded port 8000 → _gasp() ✓')
     exit(0)
 
 MARKER = 'app.include_router(agent_proxy_router)'
@@ -697,8 +1008,14 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     import websockets as _ws
     from starlette.responses import StreamingResponse as _SR
     params = dict(request.query_params)
+    # [OH-TAB] inject session_api_key if missing (GET /api/conversations/{id} returns null for V1)
+    if "session_api_key" not in params:
+        from openhands.server.routes.agent_server_proxy import _get_agent_server_key as _gask
+        _srv_key = _gask()
+        if _srv_key:
+            params["session_api_key"] = _srv_key
     qs = "&".join(f"{k}={v}" for k, v in params.items())
-    ws_url = f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
+    ws_url = f"ws://127.0.0.1:{_gasp()}/sockets/events/{conversation_id}"
     if qs:
         ws_url += f"?{qs}"
     async def _gen():
@@ -709,17 +1026,23 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
         for attempt in range(30):  # retry up to 90s while conversation starts
             try:
                 _url = ws_url if attempt == 0 else (
-                    f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
+                    f"ws://127.0.0.1:{_gasp()}/sockets/events/{conversation_id}"
                     + (f"?{_base_qs}" if _base_qs else "")
                 )
                 async with _ws.connect(_url) as ws:
                     if not connected:
                         yield "data: __connected__\\n\\n"
                         connected = True
-                    async for msg in ws:
-                        data = msg if isinstance(msg, str) else msg.decode()
-                        data = data.replace("\\n", "\\\\n")
-                        yield f"data: {data}\\n\\n"
+                    while True:  # [OH-TAB] heartbeat: prevents klogin 60s idle timeout
+                        try:
+                            msg = await _asyncio.wait_for(ws.recv(), timeout=15)
+                            data = msg if isinstance(msg, str) else msg.decode()
+                            data = data.replace("\\n", "\\\\n")
+                            yield f"data: {data}\\n\\n"
+                        except _asyncio.TimeoutError:
+                            yield ":heartbeat\\n\\n"  # keep klogin proxy alive
+                        except Exception:
+                            break  # WS closed, exit inner loop
                     return  # clean close
             except Exception:
                 pass
@@ -730,17 +1053,45 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
 
 @app.post("/api/proxy/conversations/{conversation_id}/events", include_in_schema=False)
 async def api_proxy_send_event(conversation_id: str, request: Request):
-    # Must send via WebSocket to wake up Python agent's asyncio queue.
-    # HTTP POST only stores event in DB — agent won't see it.
-    import websockets as _ws
+    # Use HTTP POST to agent-server /api/conversations/{id}/events endpoint.
+    # This avoids RuntimeError when short-lived WS closes before agent sends events back.
+    import httpx as _httpx, json as _json, uuid as _uuid
     body = await request.body()
     key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")
-    ws_url = f"ws://127.0.0.1:8000/sockets/events/{conversation_id}"
-    if key:
-        ws_url += f"?session_api_key={key}"
+    # [OH-TAB] fallback to container session key if browser has no key
+    if not key:
+        from openhands.server.routes.agent_server_proxy import _get_agent_server_key as _gask
+        key = _gask()
+    # Agent-server requires UUID format with dashes
     try:
-        async with _ws.connect(ws_url) as ws:
-            await ws.send(body.decode())
+        conv_uuid = str(_uuid.UUID(conversation_id))
+    except Exception:
+        conv_uuid = conversation_id
+    # Convert message format to SendMessageRequest (role/content/run)
+    try:
+        body_dict = _json.loads(body.decode())
+        if 'action' in body_dict and body_dict.get('action') == 'message':
+            # Old action format → SDK format
+            text = body_dict.get('args', {}).get('content', '')
+            payload = {"role": "user", "content": [{"type": "text", "text": text}], "run": True}
+        elif 'role' in body_dict:
+            # SDK Message format (from BMHP.js V1)
+            content = body_dict.get('content', '')
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            payload = {"role": body_dict.get('role', 'user'), "content": content, "run": True}
+        else:
+            payload = body_dict
+    except Exception:
+        payload = {}
+    try:
+        async with _httpx.AsyncClient() as _client:
+            await _client.post(
+                f"http://127.0.0.1:{_gasp()}/api/conversations/{conv_uuid}/events",
+                json=payload,
+                headers={"X-Session-API-Key": key},
+                timeout=10.0
+            )
     except Exception:
         pass
     return JSONResponse({"success": True})
@@ -754,6 +1105,75 @@ print('api/proxy/events 路由已注入 ✓')
 PYEOF
 sudo docker cp /tmp/patch_api_proxy_events.py openhands-app-tab:/tmp/patch_api_proxy_events.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_api_proxy_events.py
+
+# ─── 补丁3.5：SSE/POST proxy 注入 session_api_key ───
+# GET /api/conversations/{id} 对 V1 会话返回 session_api_key: null
+# → BMHP.js 的 s=null → WS URL 无 key → FakeWS SSE URL 无 key → agent-server 403
+# 修复：在 SSE proxy 注入 _gask()（从 oh-tab- 容器 env 读取全局 key）
+cat > /tmp/fix_session_key.py << 'PYEOF'
+APP_PATH = '/app/openhands/server/app.py'
+with open(APP_PATH) as f:
+    src = f.read()
+
+old_sse = (
+    '    params = dict(request.query_params)\n'
+    '    qs = "&".join(f"{k}={v}" for k, v in params.items())\n'
+    '    ws_url = f"ws://127.0.0.1:{_gasp()}/sockets/events/{conversation_id}"\n'
+    '    if qs:\n'
+    '        ws_url += f"?{qs}"'
+)
+new_sse = (
+    '    params = dict(request.query_params)\n'
+    '    # [OH-TAB] inject session_api_key if missing (GET /api/conversations/{id} returns null for V1)\n'
+    '    if "session_api_key" not in params:\n'
+    '        from openhands.server.routes.agent_server_proxy import _get_agent_server_key as _gask\n'
+    '        _srv_key = _gask()\n'
+    '        if _srv_key:\n'
+    '            params["session_api_key"] = _srv_key\n'
+    '    qs = "&".join(f"{k}={v}" for k, v in params.items())\n'
+    '    ws_url = f"ws://127.0.0.1:{_gasp()}/sockets/events/{conversation_id}"\n'
+    '    if qs:\n'
+    '        ws_url += f"?{qs}"'
+)
+
+old_post_key = (
+    '    key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")\n'
+    '    # Agent-server requires UUID format with dashes'
+)
+new_post_key = (
+    '    key = request.headers.get("X-Session-API-Key", "") or dict(request.query_params).get("session_api_key", "")\n'
+    '    # [OH-TAB] fallback to container session key if browser has no key\n'
+    '    if not key:\n'
+    '        from openhands.server.routes.agent_server_proxy import _get_agent_server_key as _gask\n'
+    '        key = _gask()\n'
+    '    # Agent-server requires UUID format with dashes'
+)
+
+changed = False
+if '[OH-TAB] inject session_api_key if missing' in src:
+    print('SSE session_api_key injection already present ✓')
+elif old_sse in src:
+    src = src.replace(old_sse, new_sse, 1)
+    print('SSE session_api_key injection applied ✓')
+    changed = True
+else:
+    print('WARNING: SSE params pattern not found!')
+
+if '[OH-TAB] fallback to container session key' in src:
+    print('POST key fallback already present ✓')
+elif old_post_key in src:
+    src = src.replace(old_post_key, new_post_key, 1)
+    print('POST key fallback applied ✓')
+    changed = True
+else:
+    print('WARNING: POST key pattern not found!')
+
+if changed:
+    with open(APP_PATH, 'w') as f:
+        f.write(src)
+PYEOF
+sudo docker cp /tmp/fix_session_key.py openhands-app-tab:/tmp/fix_session_key.py
+sudo docker exec openhands-app-tab python3 /tmp/fix_session_key.py
 
 # ─── 补丁7：index.html 注入全局 WebSocket/fetch 拦截器 ───
 # klogin 代理层会缓存 /assets/*.js，补丁可能对浏览器不生效。
@@ -885,10 +1305,15 @@ new_block = '''            assert sandbox_spec is not None
                 api_key=sandbox.session_api_key,
                 working_dir=sandbox_spec.working_dir,
             )
+            # Compute workspace root (parent dir, where Changes tab queries git)
+            _ws_root = sandbox_spec.working_dir.rsplit("/", 1)[0]
             await _tmp_ws.execute_command(
-                f"mkdir -p {conv_working_dir} && cd {conv_working_dir} && "
-                f"[ -d .git ] || git init",
-                timeout=10.0,
+                f"mkdir -p {conv_working_dir} && "
+                f"([ -d {_ws_root}/.git ] || ("
+                f"git init {_ws_root} && "
+                f"mkdir -p {_ws_root}/.git/info && "
+                f"printf 'bash_events/\\nconversations/\\n' > {_ws_root}/.git/info/exclude))",
+                timeout=15.0,
             )
             # --- end per-conversation workspace isolation ---
 
@@ -921,6 +1346,138 @@ PYEOF
 sudo docker cp /tmp/patch_per_conv_workspace.py openhands-app-tab:/tmp/patch_per_conv_workspace.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_per_conv_workspace.py
 
+# ─── 补丁8b：迁移 git init 到 workspace root（Changes tab 修复）───
+# 根因：git init 在 per-conv 子目录，但 Changes tab 始终查询 /workspace。
+# 修复：git init 在 workspace root（/workspace），用 .git/info/exclude 排除系统目录。
+cat > /tmp/patch_git_workspace_root.py << 'PYEOF'
+"""Fix: move git init from per-conv subdir to workspace root for Changes tab."""
+path = '/app/openhands/app_server/app_conversation/live_status_app_conversation_service.py'
+with open(path) as f:
+    src = f.read()
+
+old_exec = (
+    '            await _tmp_ws.execute_command(\n'
+    '                f"mkdir -p {conv_working_dir} && cd {conv_working_dir} && "\n'
+    '                f"[ -d .git ] || git init",\n'
+    '                timeout=10.0,\n'
+    '            )'
+)
+new_exec = (
+    '            # Compute workspace root (parent dir, where Changes tab queries git)\n'
+    '            _ws_root = sandbox_spec.working_dir.rsplit("/", 1)[0]\n'
+    '            await _tmp_ws.execute_command(\n'
+    '                f"mkdir -p {conv_working_dir} && "\n'
+    '                f"([ -d {_ws_root}/.git ] || ("\n'
+    '                f"git init {_ws_root} && "\n'
+    '                f"mkdir -p {_ws_root}/.git/info && "\n'
+    '                f"printf \'bash_events/\\\\nconversations/\\\\n\' > {_ws_root}/.git/info/exclude))",\n'
+    '                timeout=15.0,\n'
+    '            )'
+)
+
+if '_ws_root = sandbox_spec.working_dir.rsplit' in src:
+    print('git workspace root 补丁已存在 ✓')
+elif old_exec in src:
+    src = src.replace(old_exec, new_exec, 1)
+    with open(path, 'w') as f:
+        f.write(src)
+    print('git workspace root 补丁已应用 ✓')
+else:
+    print('WARNING: execute_command pattern not found in service file!')
+    idx = src.find('execute_command')
+    print('Context:', repr(src[max(0, idx-20):idx+200]))
+PYEOF
+sudo docker cp /tmp/patch_git_workspace_root.py openhands-app-tab:/tmp/patch_git_workspace_root.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_git_workspace_root.py
+
+# ─── 补丁9b：sandbox-port proxy 使用容器 bridge IP（App tab 访问任意容器内端口）───
+# 根因：proxy 用 http://127.0.0.1:{port}，容器内部端口（如 streamlit 8502）未映射到宿主机，
+#       无法通过宿主机 127.0.0.1 访问。
+# 修复：添加 _get_oh_tab_ip()，port < 20000 用容器 bridge IP（内部端口），
+#       port >= 20000 用 127.0.0.1（Docker NAT 映射端口，如 VSCode 39377→8001）。
+cat > /tmp/patch_sandbox_proxy_container_ip.py << 'PYEOF'
+"""Patch 9b: sandbox-port proxy uses container bridge IP for internal ports."""
+import re
+
+# 1. Add _get_oh_tab_ip() to agent_server_proxy.py
+proxy_path = '/app/openhands/server/routes/agent_server_proxy.py'
+with open(proxy_path) as f:
+    psrc = f.read()
+
+helper = (
+    '\n_oh_tab_ip_cache = ["", 0.0]\n'
+    'def _get_oh_tab_ip() -> str:\n'
+    '    """Get bridge IP of running oh-tab- container (cached 60s)."""\n'
+    '    import time as _t\n'
+    '    if _oh_tab_ip_cache[0] and _t.time() - _oh_tab_ip_cache[1] < 60:\n'
+    '        return _oh_tab_ip_cache[0]\n'
+    '    try:\n'
+    '        conn = _UnixHTTPConnection("/var/run/docker.sock")\n'
+    '        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")\n'
+    '        resp = conn.getresponse()\n'
+    '        containers = _json_mod.loads(resp.read())\n'
+    '        if not containers:\n'
+    '            return ""\n'
+    '        cid = containers[0]["Id"]\n'
+    '        conn2 = _UnixHTTPConnection("/var/run/docker.sock")\n'
+    '        conn2.request("GET", f"/containers/{cid}/json")\n'
+    '        resp2 = conn2.getresponse()\n'
+    '        cdata = _json_mod.loads(resp2.read())\n'
+    '        ip = cdata.get("NetworkSettings", {}).get("IPAddress", "")\n'
+    '        if ip:\n'
+    '            _oh_tab_ip_cache[0] = ip\n'
+    '            _oh_tab_ip_cache[1] = _t.time()\n'
+    '        return ip\n'
+    '    except Exception:\n'
+    '        return _oh_tab_ip_cache[0]\n'
+)
+
+marker = '\n# SSE 端点'
+if '_get_oh_tab_ip' in psrc:
+    print('_get_oh_tab_ip already in agent_server_proxy.py ✓')
+elif marker in psrc:
+    psrc = psrc.replace(marker, helper + marker, 1)
+    with open(proxy_path, 'w') as f:
+        f.write(psrc)
+    print('_get_oh_tab_ip added to agent_server_proxy.py ✓')
+else:
+    print('ERROR: marker not found in agent_server_proxy.py')
+    exit(1)
+
+# 2. Fix app.py sandbox-port proxy
+app_path = '/app/openhands/server/app.py'
+with open(app_path) as f:
+    asrc = f.read()
+
+if '_proxy_host' in asrc:
+    print('port heuristic already in app.py ✓')
+else:
+    # Add import
+    if '_get_oh_tab_ip as _get_oh_tab_ip' not in asrc:
+        asrc = asrc.replace(
+            'from fastapi import WebSocket as _FastAPIWebSocket\n',
+            'from fastapi import WebSocket as _FastAPIWebSocket\nfrom openhands.server.routes.agent_server_proxy import _get_oh_tab_ip as _get_oh_tab_ip\n',
+            1
+        )
+    # Fix HTTP proxy
+    asrc = asrc.replace(
+        '    import httpx as _hx, re as _re\n    target = f"http://127.0.0.1:{port}/{path}"',
+        '    import httpx as _hx, re as _re\n    _cip = _get_oh_tab_ip()\n    _proxy_host = (_cip if (_cip and port < 20000) else "127.0.0.1")\n    target = f"http://{_proxy_host}:{port}/{path}"',
+        1
+    )
+    # Fix WS proxy
+    asrc = asrc.replace(
+        '    ws_url = f"ws://127.0.0.1:{port}/{path}"',
+        '    _cip = _get_oh_tab_ip()\n    _proxy_host = (_cip if (_cip and port < 20000) else "127.0.0.1")\n    ws_url = f"ws://{_proxy_host}:{port}/{path}"',
+        1
+    )
+    with open(app_path, 'w') as f:
+        f.write(asrc)
+    print('app.py sandbox proxy updated with port heuristic ✓')
+PYEOF
+sudo docker cp /tmp/patch_sandbox_proxy_container_ip.py openhands-app-tab:/tmp/patch_sandbox_proxy_container_ip.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_proxy_container_ip.py
+
 # ─── 补丁9：sandbox port proxy（Code/App tab 浏览器访问）───
 # VSCode (8001), App 预览 (8011/8012) 的 URL 是 http://127.0.0.1:{port}，
 # 浏览器无法通过 klogin 访问。在 openhands-app-tab 注入 /api/sandbox-port/{port}/* 代理路由。
@@ -947,7 +1504,10 @@ from fastapi import WebSocket as _FastAPIWebSocket
 async def sandbox_port_proxy(port: int, path: str, request: Request):
     """Reverse proxy any sandbox port through openhands-app-tab (port 3003)."""
     import httpx as _hx, re as _re
-    target = f"http://127.0.0.1:{port}/{path}"
+    # Low ports (<20000) are container-internal; high ports are Docker NAT-mapped (use 127.0.0.1)
+    _cip = _get_oh_tab_ip()
+    _proxy_host = (_cip if (_cip and port < 20000) else "127.0.0.1")
+    target = f"http://{_proxy_host}:{port}/{path}"
     qs = str(request.query_params)
     if qs:
         target += f"?{qs}"
@@ -1013,7 +1573,9 @@ async def sandbox_port_ws_proxy(port: int, path: str, websocket: _FastAPIWebSock
     import websockets as _ws
     await websocket.accept()
     qs = str(websocket.query_params)
-    ws_url = f"ws://127.0.0.1:{port}/{path}"
+    _cip = _get_oh_tab_ip()
+    _proxy_host = (_cip if (_cip and port < 20000) else "127.0.0.1")
+    ws_url = f"ws://{_proxy_host}:{port}/{path}"
     if qs:
         ws_url += f"?{qs}"
     try:
@@ -1240,19 +1802,30 @@ sudo docker exec openhands-app-tab python3 /tmp/patch_per_conv_workspace.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_port_proxy.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_exposed_urls.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_rate_limiter.py
-# 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发）
+sudo docker exec openhands-app-tab python3 /tmp/patch_browser_store_expose.py
+# 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发，含 browser tab fix）
 sudo docker cp openhands-app-tab:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
-python3 /tmp/update_fakews.py 2>/dev/null || python3 << 'INNEREOF'
+python3 << 'INNEREOF'
 import re
 with open('/tmp/oh-index.html') as f: html = f.read()
 if 'FakeWS' in html:
     html = re.sub(r'<script>\(function\(\)\{[^<]*FakeWS[^<]*\}\)\(\);</script>', '', html, flags=re.DOTALL)
 inject = (
-    '<script>(function(){var _f=window.fetch;window.fetch=function(u,o){if(typeof u==="string"&&u.indexOf("127.0.0.1:8000")>=0){u=u.replace(/https?:\\/\\/127\\.0\\.0\\.1:8000/,"/agent-server-proxy");}return _f.call(this,u,o);};var _X=window.XMLHttpRequest.prototype.open;window.XMLHttpRequest.prototype.open=function(m,u){if(typeof u==="string"&&u.indexOf("127.0.0.1:8000")>=0){u=u.replace(/https?:\\/\\/127\\.0\\.0\\.1:8000/,"/agent-server-proxy");}return _X.apply(this,arguments);};var _WS=window.WebSocket;function FakeWS(url,proto){var self=this;self.readyState=0;self.onopen=null;self.onmessage=null;self.onclose=null;self.onerror=null;self._es=null;var m=url.match(/\\/sockets\\/events\\/([^?]+)/);var id=m?m[1]:"";var queryStr=url.indexOf("?")>=0?url.split("?")[1]:"";var params=new URLSearchParams(queryStr);var key=params.get("session_api_key")||"";var sseUrl="/api/proxy/events/"+id+"/stream?resend_all=true";if(key)sseUrl+="&session_api_key="+encodeURIComponent(key);self.send=function(d){fetch("/api/proxy/conversations/"+id+"/events",{method:"POST",headers:{"Content-Type":"application/json","X-Session-API-Key":key},body:d}).catch(function(){});};self.close=function(){if(self._es){self._es.close();self._es=null;}self.readyState=3;if(self.onclose)self.onclose({code:1000,reason:"",wasClean:true});};var es=new EventSource(sseUrl);self._es=es;es.onopen=function(){self.readyState=1;if(self.onopen)self.onopen({});};es.onmessage=function(ev){if(ev.data==="__connected__")return;if(ev.data==="__closed__"){self.readyState=3;if(self.onclose)self.onclose({code:1000,wasClean:true});return;}if(self.onmessage)self.onmessage({data:ev.data});};es.onerror=function(){if(self._es){self._es.close();self._es=null;}self.readyState=3;if(self.onerror)self.onerror({});if(self.onclose)self.onclose({code:1006,reason:"",wasClean:false});};}FakeWS.CONNECTING=0;FakeWS.OPEN=1;FakeWS.CLOSING=2;FakeWS.CLOSED=3;window.WebSocket=function(url,proto){if(url&&url.indexOf("/sockets/events/")>=0){return new FakeWS(url,proto);}return new _WS(url,proto);};window.WebSocket.prototype=_WS.prototype;window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;})();</script>'
+    '<script>(function(){'
+    'var _f=window.fetch;window.fetch=function(u,o){if(typeof u==="string"&&u.indexOf("127.0.0.1:8000")>=0){u=u.replace(/https?:\\/\\/127\\.0\\.0\\.1:8000/,"/agent-server-proxy");}return _f.call(this,u,o);};'
+    'var _X=window.XMLHttpRequest.prototype.open;window.XMLHttpRequest.prototype.open=function(m,u){if(typeof u==="string"&&u.indexOf("127.0.0.1:8000")>=0){u=u.replace(/https?:\\/\\/127\\.0\\.0\\.1:8000/,"/agent-server-proxy");}return _X.apply(this,arguments);};'
+    'window.__oh_browse=null;'
+    'window._ohApplyBrowse=function(){var d=window.__oh_browse;if(!d)return;var bs=window.__oh_browser_store;if(bs&&bs.getState){window.__oh_browse=null;var ss=d.ss;if(ss){bs.getState().setScreenshotSrc(ss.startsWith("data:")?ss:"data:image/png;base64,"+ss);}if(d.url){bs.getState().setUrl(d.url);}}else{setTimeout(window._ohApplyBrowse,300);}};'
+    'var _WS=window.WebSocket;'
+    'function FakeWS(url,proto){var self=this;self.readyState=0;self.onopen=null;self.onmessage=null;self.onclose=null;self.onerror=null;self._es=null;var m=url.match(/\\/sockets\\/events\\/([^?]+)/);var id=m?m[1]:"";var queryStr=url.indexOf("?")>=0?url.split("?")[1]:"";var params=new URLSearchParams(queryStr);var key=params.get("session_api_key")||"";var sseUrl="/api/proxy/events/"+id+"/stream?resend_all=true";if(key)sseUrl+="&session_api_key="+encodeURIComponent(key);self.send=function(d){fetch("/api/proxy/conversations/"+id+"/events",{method:"POST",headers:{"Content-Type":"application/json","X-Session-API-Key":key},body:d}).catch(function(){});};self.close=function(){if(self._es){self._es.close();self._es=null;}self.readyState=3;if(self.onclose)self.onclose({code:1000,reason:"",wasClean:true});};var es=new EventSource(sseUrl);self._es=es;es.onopen=function(){self.readyState=1;if(self.onopen)self.onopen({});};es.onmessage=function(ev){if(ev.data==="__connected__")return;if(ev.data==="__closed__"){self.readyState=3;if(self.onclose)self.onclose({code:1000,wasClean:true});return;}try{var _d=JSON.parse(ev.data);var _ss="",_url="";if(_d&&_d.observation&&typeof _d.observation==="object"&&_d.observation.kind==="BrowserObservation"){_ss=_d.observation.screenshot_data||"";_url=_d.observation.url||"";}else if(_d&&(_d.observation==="browse"||_d.observation==="browse_interactive")){_ss=(_d.extras&&_d.extras.screenshot)||"";_url=(_d.extras&&_d.extras.url)||"";}if(_ss||_url){window.__oh_browse={ss:_ss,url:_url};window._ohApplyBrowse();}}catch(e){}if(self.onmessage)self.onmessage({data:ev.data});};es.onerror=function(){if(self._es){self._es.close();self._es=null;}self.readyState=3;if(self.onerror)self.onerror({});if(self.onclose)self.onclose({code:1006,reason:"",wasClean:false});};}'
+    'FakeWS.CONNECTING=0;FakeWS.OPEN=1;FakeWS.CLOSING=2;FakeWS.CLOSED=3;'
+    'window.WebSocket=function(url,proto){if(url&&url.indexOf("/sockets/events/")>=0){return new FakeWS(url,proto);}return new _WS(url,proto);};'
+    'window.WebSocket.prototype=_WS.prototype;window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;'
+    '})();</script>'
 )
 with open('/tmp/oh-index.html', 'w') as f: f.write(html.replace('<head>', '<head>' + inject, 1))
-print('重启后重新注入 index.html FakeWS ✓')
+print('重启后重新注入 index.html FakeWS（含 browser tab fix）✓')
 INNEREOF
 sudo docker cp /tmp/oh-index.html openhands-app-tab:/app/frontend/build/index.html 2>/dev/null || true
 REMOTE
