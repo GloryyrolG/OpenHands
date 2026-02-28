@@ -328,7 +328,6 @@ sudo docker exec openhands-app-tab python3 /tmp/patch_bridge_fixes.py
 
 cat > /tmp/agent_server_proxy.py << 'PYEOF'
 import asyncio
-import functools as _ft
 import json as _json_mod
 import re as _re_mod
 import socket as _socket_mod
@@ -344,8 +343,9 @@ agent_proxy_router = APIRouter(prefix="/agent-server-proxy")
 # Per-session isolation: SQLite DB at ~/.openhands/openhands.db (app writes to home dir)
 _DB_PATH = '/root/.openhands/openhands.db'
 
-# Per-conversation URL cache: conversation_id -> agent_server_url
+# Per-conversation URL cache: conversation_id -> (agent_server_url, timestamp)
 _url_cache: dict = {}
+_URL_CACHE_TTL = 3600  # 1 hour; URLs don't change once task is READY
 
 
 class _UnixHTTPConnection(_http_client.HTTPConnection):
@@ -358,9 +358,12 @@ class _UnixHTTPConnection(_http_client.HTTPConnection):
         self.sock = s
 
 
-@_ft.lru_cache(maxsize=1)
+_agent_port_cache = [0, 0.0]
 def _get_agent_server_port() -> int:
-    """Fallback: get host port of first oh-tab- container's port 8000."""
+    """Fallback: get host port of first oh-tab- container's port 8000 (cached 60s)."""
+    import time as _t
+    if _agent_port_cache[0] and _t.time() - _agent_port_cache[1] < 60:
+        return _agent_port_cache[0]
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
         conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")
@@ -370,15 +373,21 @@ def _get_agent_server_port() -> int:
             return 8000
         for port_info in containers[0].get("Ports", []):
             if port_info.get("PrivatePort") == 8000 and port_info.get("PublicPort"):
-                return port_info["PublicPort"]
+                port = port_info["PublicPort"]
+                _agent_port_cache[0] = port
+                _agent_port_cache[1] = _t.time()
+                return port
         return 8000
     except Exception:
-        return 8000
+        return _agent_port_cache[0] or 8000
 
 
-@_ft.lru_cache(maxsize=1)
+_agent_key_cache = ["", 0.0]
 def _get_agent_server_key() -> str:
-    """Read session_api_key from first oh-tab- container via Docker API."""
+    """Read session_api_key from first oh-tab- container via Docker API (cached 60s)."""
+    import time as _t
+    if _agent_key_cache[0] and _t.time() - _agent_key_cache[1] < 60:
+        return _agent_key_cache[0]
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
         conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")
@@ -394,10 +403,13 @@ def _get_agent_server_key() -> str:
         env_list = cdata.get("Config", {}).get("Env", [])
         for e in env_list:
             if e.startswith("OH_SESSION_API_KEYS_0="):
-                return e.split("=", 1)[1]
+                key = e.split("=", 1)[1]
+                _agent_key_cache[0] = key
+                _agent_key_cache[1] = _t.time()
+                return key
         return ""
     except Exception:
-        return ""
+        return _agent_key_cache[0]
 
 
 _oh_tab_ip_cache = ["", 0.0]
@@ -428,12 +440,16 @@ def _get_oh_tab_ip() -> str:
         return _oh_tab_ip_cache[0]
 
 
-_key_cache: dict = {}
+_key_cache: dict = {}  # cid -> (key, timestamp)
+_KEY_CACHE_TTL = 3600  # 1 hour; keys don't change during container lifetime
 def _get_tab_agent_key(conversation_id: str) -> str:
     """Get session_api_key for this conversation's oh-tab- container via Docker API."""
+    import time as _t
     cid = conversation_id.removeprefix('task-').replace('-', '')
     if cid in _key_cache:
-        return _key_cache[cid]
+        key, ts = _key_cache[cid]
+        if _t.time() - ts < _KEY_CACHE_TTL:
+            return key
     try:
         conn = _sqlite3.connect(_DB_PATH, timeout=3)
         cur = conn.cursor()
@@ -453,7 +469,7 @@ def _get_tab_agent_key(conversation_id: str) -> str:
         for e in cdata.get("Config", {}).get("Env", []):
             if e.startswith("OH_SESSION_API_KEYS_0="):
                 key = e.split("=", 1)[1]
-                _key_cache[cid] = key
+                _key_cache[cid] = (key, _t.time())
                 return key
     except Exception:
         pass
@@ -506,12 +522,15 @@ def _resolve_tab_agent_url(conversation_id: str) -> str:
 def _get_tab_agent_url(conversation_id: str) -> str:
     """Get agent server URL for this conversation (with cache).
     Falls back to first oh-tab- container if DB lookup fails."""
+    import time as _t
     cid = conversation_id.removeprefix('task-').replace('-', '')
     if cid in _url_cache:
-        return _url_cache[cid]
+        url, ts = _url_cache[cid]
+        if _t.time() - ts < _URL_CACHE_TTL:
+            return url
     url = _resolve_tab_agent_url(cid)
     if url:
-        _url_cache[cid] = url
+        _url_cache[cid] = (url, _t.time())
         return url
     # Fallback: use first oh-tab- container's published port
     fallback = f"http://127.0.0.1:{_get_agent_server_port()}"
@@ -612,11 +631,11 @@ async def proxy_send_event_ws(conversation_id: str, request: Request):
 @agent_proxy_router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_http(request: Request, path: str):
     # Per-conversation routing: extract conversation_id from path or Referer
-    m = _re_mod.search(r'conversations/([a-f0-9\-]{32,36})', path)
+    m = _re_mod.search(r'conversations/((?:task-)?[a-f0-9\-]{32,40})', path)
     if not m:
         # Try Referer header: browser sends Referer: .../conversations/{id} for API calls
         _referer = request.headers.get("referer", "")
-        m = _re_mod.search(r'conversations/([a-f0-9\-]{32,36})', _referer)
+        m = _re_mod.search(r'conversations/((?:task-)?[a-f0-9\-]{32,40})', _referer)
     conv_id = m.group(1) if m else None
     if conv_id:
         agent_base = _get_tab_agent_url(conv_id)
@@ -1657,6 +1676,7 @@ PROXY_ROUTES = '''
 
 # --- Sandbox port proxy: VSCode (8001), App (8011/8012) ---
 from fastapi import WebSocket as _FastAPIWebSocket
+from openhands.server.routes.agent_server_proxy import _get_oh_tab_ip as _get_oh_tab_ip
 @app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
 async def sandbox_port_proxy(port: int, path: str, request: Request):
     """Reverse proxy any sandbox port through openhands-app-tab (port 3003)."""
@@ -2129,36 +2149,6 @@ proxy_path = '/app/openhands/server/routes/agent_server_proxy.py'
 with open(proxy_path) as f:
     proxy_src = f.read()
 
-# Fix 1a: Add _get_oh_tab_container_for_port if missing
-if '_get_oh_tab_container_for_port' not in proxy_src:
-    new_func = '''
-def _get_oh_tab_container_for_port(host_port: int) -> dict:
-    """Find the oh-tab- container that has host_port mapped (Docker NAT)."""
-    try:
-        conn = _UnixHTTPConnection("/var/run/docker.sock")
-        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")
-        resp = conn.getresponse()
-        containers = _json_mod.loads(resp.read())
-        for c in containers:
-            for p in c.get("Ports", []):
-                if p.get("PublicPort") == host_port:
-                    cid = c["Id"]
-                    conn2 = _UnixHTTPConnection("/var/run/docker.sock")
-                    conn2.request("GET", f"/containers/{cid}/json")
-                    resp2 = conn2.getresponse()
-                    return _json_mod.loads(resp2.read())
-    except Exception:
-        pass
-    return {}
-
-'''
-    proxy_src = proxy_src.replace('def _resolve_tab_agent_url', new_func + 'def _resolve_tab_agent_url', 1)
-    with open(proxy_path, 'w') as f:
-        f.write(proxy_src)
-    print('agent_server_proxy.py: _get_oh_tab_container_for_port added ✓')
-else:
-    print('agent_server_proxy.py: _get_oh_tab_container_for_port already exists ✓')
-
 # Fix 1b: git/changes 401 → []
 with open(proxy_path) as f:
     proxy_src = f.read()
@@ -2574,7 +2564,7 @@ OLD_SCAN_EXC_V2 = (
     '                        try:\n'
     '                            import asyncio as _asyncio\n'
     '                            from openhands.server.routes.agent_server_proxy import _docker_exec_http as _deh\n'
-    '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_event_loop().run_in_executor(\n'
+    '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_running_loop().run_in_executor(\n'
     '                                None, _deh, _cid2, _sp_port, _sp_path)\n'
     '                            _scan_hdrs2 = {k:v for k,v in _hdrs2.items()\n'
     '                                if k.lower() not in ("content-encoding","transfer-encoding","connection","content-security-policy")}\n'
@@ -2599,7 +2589,7 @@ NEW_SCAN_EXC = (
     '                            from openhands.server.routes.agent_server_proxy import _docker_exec_http as _deh\n'
     '                            _exec_body = await request.body()\n'
     '                            _exec_hdrs = dict(request.headers)\n'
-    '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_event_loop().run_in_executor(\n'
+    '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_running_loop().run_in_executor(\n'
     '                                None, _deh, _cid2, _sp_port, _sp_path, request.method, _exec_body, _exec_hdrs)\n'
     '                            # Rewrite Location for app-internal redirects\n'
     '                            import urllib.parse as _up3\n'
@@ -2877,12 +2867,12 @@ changes = 0
 # Fix A: docker-exec fallback path — insert after run_in_executor, before "Rewrite Location"
 if '[oh-tab-dir-reject]' not in src:
     OLD_EXEC = (
-        '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_event_loop().run_in_executor(\n'
+        '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_running_loop().run_in_executor(\n'
         '                                None, _deh, _cid2, _sp_port, _sp_path, request.method, _exec_body, _exec_hdrs)\n'
         '                            # Rewrite Location for app-internal redirects\n'
     )
     NEW_EXEC = (
-        '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_event_loop().run_in_executor(\n'
+        '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_running_loop().run_in_executor(\n'
         '                                None, _deh, _cid2, _sp_port, _sp_path, request.method, _exec_body, _exec_hdrs)\n'
         '                            # [oh-tab-dir-reject] Directory listing on scan probe -> 502 (skip port)\n'
         '                            if (request.headers.get("x-oh-tab-scan") == "1"\n'
