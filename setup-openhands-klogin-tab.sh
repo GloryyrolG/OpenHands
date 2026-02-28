@@ -2362,25 +2362,33 @@ NEW_EXEC_FUNC = '''
 def _docker_exec_http(container_id: str, port: int, path: str,
                        method: str = "GET", body_bytes: bytes = b"",
                        req_headers: dict = None) -> tuple:
-    """Proxy HTTP request via docker exec curl (for 127.0.0.1-bound apps).
-    Forwards Cookie, Content-Type, request method and body.
+    """[OH-TAB-PY3] Proxy HTTP request via docker exec python3 (for 127.0.0.1-bound apps).
+    Uses python3 http.client — no curl dependency. Forwards Cookie/Content-Type/body.
     Returns (status_code, headers_dict, body_bytes, content_type_str)."""
-    import json as _j
-    url = f"http://127.0.0.1:{port}/{path}"
-    cmd = ["curl", "-s", "-m", "10", "--include", "-X", method]
+    import json as _j, base64 as _b64
+    _cookie = ""
+    _ct_hdr = ""
     if req_headers:
         _cookie = req_headers.get("cookie") or req_headers.get("Cookie", "")
-        if _cookie:
-            cmd += ["-H", f"Cookie: {_cookie}"]
         _ct_hdr = req_headers.get("content-type") or req_headers.get("Content-Type", "")
-        if _ct_hdr:
-            cmd += ["-H", f"Content-Type: {_ct_hdr}"]
-    if body_bytes:
-        try:
-            cmd += ["--data-raw", body_bytes.decode("utf-8", errors="replace")]
-        except Exception:
-            pass
-    cmd += [url]
+    _body_b64 = _b64.b64encode(body_bytes).decode() if body_bytes else ""
+    _req_path = "/" + path if path else "/"
+    # Build python3 one-liner: http.client request → raw HTTP response on stdout
+    _py = (
+        "import http.client as _c,sys,base64 as _b;"
+        "_h={'Connection':'close'};"
+        + (f"_h['Cookie']={repr(_cookie)};" if _cookie else "")
+        + (f"_h['Content-Type']={repr(_ct_hdr)};" if _ct_hdr else "")
+        + f"_bd=_b.b64decode({repr(_body_b64)}) if {repr(_body_b64)} else b'';"
+        f"conn=_c.HTTPConnection('127.0.0.1',{port},timeout=10);"
+        f"conn.request({repr(method)},{repr(_req_path)},_bd,_h);"
+        "r=conn.getresponse();"
+        "sys.stdout.buffer.write(b'HTTP/1.1 '+str(r.status).encode()+b' OK\\r\\n');"
+        "[(sys.stdout.buffer.write((k+': '+v+'\\r\\n').encode())) for k,v in r.getheaders()];"
+        "sys.stdout.buffer.write(b'\\r\\n');"
+        "sys.stdout.buffer.write(r.read())"
+    )
+    cmd = ["python3", "-c", _py]
     exec_body = _j.dumps({
         "Cmd": cmd, "AttachStdout": True, "AttachStderr": False, "User": "root"
     }).encode()
@@ -2408,11 +2416,11 @@ def _docker_exec_http(container_id: str, port: int, path: str,
         if size == 0:
             pos += 8
             continue
-        if stream_type == 1:
+        if stream_type == 1:  # stdout only
             stdout += raw[pos+8:pos+8+size]
         pos += 8 + size
     if b"\\r\\n\\r\\n" not in stdout:
-        raise Exception(f"no HTTP separator ({len(stdout)} bytes)")
+        raise Exception(f"no HTTP separator ({len(stdout)} bytes stdout)")
     headers_raw, body = stdout.split(b"\\r\\n\\r\\n", 1)
     lines = headers_raw.split(b"\\r\\n")
     status_code = int(lines[0].decode().split()[1]) if lines else 502
@@ -2428,22 +2436,22 @@ def _docker_exec_http(container_id: str, port: int, path: str,
 
 '''
 
-if 'method: str = "GET"' in proxy_src:
-    print('agent_server_proxy.py: _docker_exec_http already updated ✓')
+if '[OH-TAB-PY3]' in proxy_src:
+    print('agent_server_proxy.py: _docker_exec_http already python3 version ✓')
 elif '_docker_exec_http' not in proxy_src:
     proxy_src = proxy_src.replace('def _get_oh_tab_container_for_port', NEW_EXEC_FUNC + 'def _get_oh_tab_container_for_port', 1)
     with open(proxy_path, 'w') as f:
         f.write(proxy_src)
-    print('agent_server_proxy.py: _docker_exec_http added ✓')
+    print('agent_server_proxy.py: _docker_exec_http added (python3 version) ✓')
 else:
-    # Replace old GET-only version with new method/body/cookie version
+    # Replace old curl/GET-only version with python3 version
     idx = proxy_src.find('def _docker_exec_http(')
     end_idx = proxy_src.find('\ndef ', idx + 1)
     if idx >= 0 and end_idx > idx:
         proxy_src = proxy_src[:idx] + NEW_EXEC_FUNC.strip() + '\n\n' + proxy_src[end_idx+1:]
         with open(proxy_path, 'w') as f:
             f.write(proxy_src)
-        print('agent_server_proxy.py: _docker_exec_http replaced with method/body/cookie version ✓')
+        print('agent_server_proxy.py: _docker_exec_http upgraded to python3 (no curl needed) ✓')
     else:
         print('WARNING: could not find _docker_exec_http end boundary')
 
@@ -2625,6 +2633,134 @@ else:
 
 with open(app_path, 'w') as f:
     f.write(src)
+
+# ─── Fix 9: Upgrade _docker_exec_http to python3 (no curl dependency) ───
+# The agent-server:1.10.0-python image may not have curl at the container top level.
+# Python3 is always available. Detect old curl version and upgrade.
+proxy_path = '/app/openhands/server/routes/agent_server_proxy.py'
+with open(proxy_path) as f:
+    proxy_src = f.read()
+
+if '[OH-TAB-PY3]' in proxy_src:
+    print('agent_server_proxy.py: _docker_exec_http already python3 version ✓')
+elif 'def _docker_exec_http(' in proxy_src:
+    import base64 as _b64_fix9
+    # Build the new python3-based _docker_exec_http
+    NEW_EXEC_PY3 = '''def _docker_exec_http(container_id: str, port: int, path: str,
+                       method: str = "GET", body_bytes: bytes = b"",
+                       req_headers: dict = None) -> tuple:
+    """[OH-TAB-PY3] Proxy HTTP request via docker exec python3 (for 127.0.0.1-bound apps).
+    Uses python3 http.client — no curl dependency. Forwards Cookie/Content-Type/body.
+    Returns (status_code, headers_dict, body_bytes, content_type_str)."""
+    import json as _j, base64 as _b64
+    _cookie = ""
+    _ct_hdr = ""
+    if req_headers:
+        _cookie = req_headers.get("cookie") or req_headers.get("Cookie", "")
+        _ct_hdr = req_headers.get("content-type") or req_headers.get("Content-Type", "")
+    _body_b64 = _b64.b64encode(body_bytes).decode() if body_bytes else ""
+    _req_path = "/" + path if path else "/"
+    _py = (
+        "import http.client as _c,sys,base64 as _b;"
+        "_h={'Connection':'close'};"
+        + ("_h['Cookie']=" + repr(_cookie) + ";" if _cookie else "")
+        + ("_h['Content-Type']=" + repr(_ct_hdr) + ";" if _ct_hdr else "")
+        + "_bd=_b.b64decode(" + repr(_body_b64) + ") if " + repr(_body_b64) + " else b'';"
+        + "conn=_c.HTTPConnection('127.0.0.1'," + str(port) + ",timeout=10);"
+        + "conn.request(" + repr(method) + "," + repr(_req_path) + ",_bd,_h);"
+        + "r=conn.getresponse();"
+        + "sys.stdout.buffer.write(b'HTTP/1.1 '+str(r.status).encode()+b' OK\\r\\n');"
+        + "[(sys.stdout.buffer.write((k+': '+v+'\\r\\n').encode())) for k,v in r.getheaders()];"
+        + "sys.stdout.buffer.write(b'\\r\\n');"
+        + "sys.stdout.buffer.write(r.read())"
+    )
+    cmd = ["python3", "-c", _py]
+    exec_body = _j.dumps({
+        "Cmd": cmd, "AttachStdout": True, "AttachStderr": False, "User": "root"
+    }).encode()
+    conn = _UnixHTTPConnection("/var/run/docker.sock")
+    conn.request("POST", f"/containers/{container_id}/exec", body=exec_body,
+                 headers={"Content-Type": "application/json",
+                          "Content-Length": str(len(exec_body))})
+    resp = conn.getresponse()
+    exec_info = _j.loads(resp.read())
+    exec_id = exec_info.get("Id")
+    if not exec_id:
+        raise Exception("exec create failed")
+    start_body = b\'{"Detach":false,"Tty":false}\'
+    conn2 = _UnixHTTPConnection("/var/run/docker.sock")
+    conn2.request("POST", f"/exec/{exec_id}/start", body=start_body,
+                  headers={"Content-Type": "application/json",
+                           "Content-Length": str(len(start_body))})
+    resp2 = conn2.getresponse()
+    raw = resp2.read()
+    stdout = b""
+    pos = 0
+    while pos + 8 <= len(raw):
+        stream_type = raw[pos]
+        size = int.from_bytes(raw[pos+4:pos+8], "big")
+        if size == 0:
+            pos += 8
+            continue
+        if stream_type == 1:  # stdout only
+            stdout += raw[pos+8:pos+8+size]
+        pos += 8 + size
+    if b"\\r\\n\\r\\n" not in stdout:
+        raise Exception(f"no HTTP separator ({len(stdout)} bytes stdout)")
+    headers_raw, body = stdout.split(b"\\r\\n\\r\\n", 1)
+    lines = headers_raw.split(b"\\r\\n")
+    status_code = int(lines[0].decode().split()[1]) if lines else 502
+    hdrs = {}
+    ct = ""
+    for line in lines[1:]:
+        if b": " in line:
+            k, v = line.decode().split(": ", 1)
+            hdrs[k.lower()] = v
+            if k.lower() == "content-type":
+                ct = v
+    return status_code, hdrs, body, ct
+
+'''
+    idx = proxy_src.find('def _docker_exec_http(')
+    end_idx = proxy_src.find('\ndef ', idx + 1)
+    if idx >= 0 and end_idx > idx:
+        proxy_src = proxy_src[:idx] + NEW_EXEC_PY3 + proxy_src[end_idx+1:]
+        with open(proxy_path, 'w') as f:
+            f.write(proxy_src)
+        print('agent_server_proxy.py: _docker_exec_http upgraded to python3 ✓')
+    else:
+        print('WARNING: could not find _docker_exec_http boundary in proxy file')
+else:
+    print('agent_server_proxy.py: _docker_exec_http not found, skipping ✓')
+
+# ─── Fix 9b: Better _cip2 extraction (handle custom Docker networks) ───
+# Some Docker setups use custom networks; NetworkSettings.IPAddress is empty in that case.
+# Fall back to Networks dict to get any available IP.
+with open(app_path) as f:
+    src = f.read()
+
+OLD_CIP2 = (
+    '            _cip2 = _cdata2.get("NetworkSettings", {}).get("IPAddress", "")\n'
+    '            if _cip2:\n'
+)
+NEW_CIP2 = (
+    '            # [OH-TAB-FIX9B] get bridge IP: try primary IP, then any network IP\n'
+    '            _ns2 = _cdata2.get("NetworkSettings", {})\n'
+    '            _cip2 = (_ns2.get("IPAddress", "")\n'
+    '                or next((v.get("IPAddress","") for v in _ns2.get("Networks",{}).values()\n'
+    '                         if v.get("IPAddress","")), ""))\n'
+    '            if _cip2:\n'
+)
+if '[OH-TAB-FIX9B]' in src:
+    print('app.py: Fix 9b (_cip2 network fallback) already applied ✓')
+elif OLD_CIP2 in src:
+    src = src.replace(OLD_CIP2, NEW_CIP2, 1)
+    with open(app_path, 'w') as f:
+        f.write(src)
+    print('app.py: Fix 9b applied (_cip2 custom network fallback) ✓')
+else:
+    print('app.py: Fix 9b: _cip2 pattern not found (may already be patched differently) ✓')
+
 PYEOF
 sudo docker cp /tmp/patch_tabs_fixes.py openhands-app-tab:/tmp/patch_tabs_fixes.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_tabs_fixes.py
