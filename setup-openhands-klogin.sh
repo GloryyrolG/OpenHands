@@ -1001,6 +1001,41 @@ PYEOF
 sudo docker cp /tmp/patch_sandbox_exposed_urls.py openhands-app:/tmp/patch_sandbox_exposed_urls.py
 sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
 
+# ─── 补丁10b：sandbox pid_mode=host（允许 agent kill 被占用端口）───
+# 根因：host network 模式下多 sandbox 共享宿主机网络 namespace 但各有独立 PID namespace，
+# agent 在容器内看到端口被占用却无法 kill 对应进程（跨 PID namespace 不可见）。
+# 修复：sandbox 容器加 --pid=host，agent 可直接 fuser -k <port>/tcp 释放端口。
+cat > /tmp/patch_pid_host.py << 'PYEOF'
+path = '/app/openhands/app_server/sandbox/docker_sandbox_service.py'
+with open(path) as f:
+    src = f.read()
+
+if "pid_mode='host'" in src:
+    print('pid_mode=host 补丁已存在 ✓')
+    exit(0)
+
+old = '''                # Network mode: 'host' for host networking, None for default bridge
+                network_mode=network_mode,
+            )'''
+
+new = '''                # Network mode: 'host' for host networking, None for default bridge
+                network_mode=network_mode,
+                # Allow sandbox to see all host PIDs so agent can kill processes on occupied ports
+                pid_mode='host' if self.use_host_network else None,
+            )'''
+
+if old not in src:
+    print('ERROR: pattern 未匹配，请检查文件')
+    exit(1)
+
+src = src.replace(old, new, 1)
+with open(path, 'w') as f:
+    f.write(src)
+print('pid_mode=host 补丁已应用 ✓')
+PYEOF
+sudo docker cp /tmp/patch_pid_host.py openhands-app:/tmp/patch_pid_host.py
+sudo docker exec openhands-app python3 /tmp/patch_pid_host.py
+
 # ─── 补丁11：vscode-tab JS 修复 + z-suffix cache busting ───
 # 根因：new URL(r.url) 当 r.url 是相对路径时抛 TypeError → "Error parsing URL"
 # 修复：new URL(r.url, window.location.origin)
@@ -1243,7 +1278,8 @@ echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
 echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
 echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问，CSP stripped, remoteAuthority cleared）"
-echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
+echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）
+  - sandbox pid_mode=host（agent 可 kill 被占用端口）"
 echo "  - vscode-tab URL parse fix（new URL relative path fix + z-suffix cache busting）"
 echo "  - git-service.js poll 修复（V1 新建会话直接返回真实 conversation_id）"
 echo "  - task-nav-fix（index.html 兜底脚本，确保浏览器缓存情况下也能跳转会话）"
