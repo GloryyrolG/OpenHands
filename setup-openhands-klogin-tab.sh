@@ -1264,6 +1264,17 @@ inject = (
     'return new _WS(url,proto);};'
     'window.WebSocket.prototype=_WS.prototype;'
     'window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;'
+    # [oh-tab-enter-fix] Enter key triggers blur in served-tab URL address bar
+    # Only fires for inputs whose value looks like a URL (avoids affecting chat input)
+    'document.addEventListener("keydown",function(e){'
+    'if(e.key!=="Enter")return;'
+    'var el=document.activeElement;'
+    'if(!el||el.tagName!=="INPUT")return;'
+    'var v=el.value||"";'
+    'if(!v.match(/^(https?:\\/\\/|\\/api\\/sandbox-port\\/)/))return;'
+    'if(!el.closest("form"))return;'
+    'e.preventDefault();el.blur();'
+    '},true);'
     '})();</script>'
 )
 html = html.replace('<head>', '<head>' + inject, 1)
@@ -1532,6 +1543,13 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
                 resp_headers[k] = v
             content = resp.content
             ct = resp.headers.get("content-type", "")
+            # [oh-tab-agent-check] If agent server JSON at root GET, show scan page
+            if (resp.status_code == 200 and request.method == "GET" and not path
+                    and "application/json" in ct
+                    and request.headers.get("x-oh-tab-scan") != "1"
+                    and b\'"OpenHands Agent Server"\' in content[:200]):
+                from starlette.responses import HTMLResponse as _HtmlResp
+                return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)
             if "text/html" in ct and content:
                 try:
                     html = content.decode("utf-8")
@@ -1775,6 +1793,106 @@ PYEOF
 sudo docker cp /tmp/patch_vscode_tab.py openhands-app-tab:/tmp/patch_vscode_tab.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_vscode_tab.py
 
+# ─── 补丁12a：sandbox-port proxy 连接失败时返回端口自动扫描页（App tab 自动跳到运行中的 app）───
+# 根因：WORKER 端口（8011/8012）通常没有监听；真实 app（如 streamlit）在内部端口（8502）。
+# 修复：proxy 收到 ConnectError 且路径为根路径时，返回一段 HTML，
+#       自动扫描常用端口（3000,5000,7860,8080,8501,8502,...），找到后跳转。
+cat > /tmp/patch_port_scan_html.py << 'PYEOF'
+"""Patch 12a: sandbox_port_proxy returns auto-scan HTML on connection error at root GET."""
+APP_PATH = '/app/openhands/server/app.py'
+with open(APP_PATH) as f:
+    src = f.read()
+
+if '[oh-tab-port-scan]' in src:
+    print('Auto-scan HTML already in sandbox_port_proxy ✓')
+    exit(0)
+
+SCAN_HTML = (
+    '<!DOCTYPE html><html><head><title>App Scanner</title>'
+    '<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;'
+    'height:100vh;margin:0;background:#1a1a2e;color:#eee;}'
+    '.box{text-align:center;padding:2rem;}'
+    '.sp{width:40px;height:40px;border:3px solid rgba(255,255,255,0.1);'
+    'border-top-color:#4af;border-radius:50%;animation:s 1s linear infinite;margin:1rem auto;}'
+    '@keyframes s{to{transform:rotate(360deg)}}</style></head>'
+    '<body><div class="box"><div class="sp"></div>'
+    '<h3 id="m">Scanning for running app...</h3>'
+    '<p id="sub" style="color:#aaa;font-size:.85rem"></p></div>'
+    '<script>'
+    'const ports=[3000,5000,7860,8000,8008,8080,8501,8502,8503,8504,8888,9000];'
+    'async function tryPort(p){'
+    'try{const r=await fetch("/api/sandbox-port/"+p+"/",{signal:AbortSignal.timeout(2000),cache:"no-store",'
+    'headers:{"X-OH-Tab-Scan":"1"}});'
+    'if(r.status>=500)return false;'
+    'const ct=r.headers.get("content-type")||"";'
+    'return ct.includes("text/html");}catch(e){return false;}}'
+    'async function scan(){'
+    'document.getElementById("sub").textContent="Trying: "+ports.join(", ");'
+    'for(const p of ports){'
+    'document.getElementById("m").textContent="Trying port "+p+"...";'
+    'if(await tryPort(p)){'
+    'document.getElementById("m").textContent="Found app on port "+p+"! Loading...";'
+    'if(window.parent&&window.parent!==window){'
+    'window.parent.postMessage({type:"oh-tab-port-redirect",url:"/api/sandbox-port/"+p+"/"},"*");}'
+    'window.location.replace("/api/sandbox-port/"+p+"/");return;}}'
+    'document.getElementById("m").textContent="No app found yet. Retrying in 3s...";'
+    'setTimeout(scan,3000);}'
+    'scan();'
+    '</script></body></html>'
+)
+
+# Inject _PORT_SCAN_HTML constant before the proxy routes
+MARKER = '# --- Sandbox port proxy: VSCode (8001), App (8011/8012) ---'
+if MARKER not in src:
+    print('WARNING: sandbox port proxy marker not found!')
+    idx = src.find('sandbox-port')
+    print('Context:', repr(src[max(0,idx-50):idx+200]))
+    exit(1)
+
+if '_PORT_SCAN_HTML' not in src:
+    scan_const = '_PORT_SCAN_HTML = ' + repr(SCAN_HTML) + '\n\n'
+    src = src.replace(MARKER, scan_const + MARKER, 1)
+    print('_PORT_SCAN_HTML constant injected ✓')
+
+# Modify the exception handler to return scan HTML on ConnectError at root GET
+old_exc = (
+    '    except Exception as e:\n'
+    '        from starlette.responses import Response as _Resp\n'
+    '        return _Resp(content=str(e), status_code=502)\n'
+    '\n'
+    '@app.api_route("/api/sandbox-port/{port}/"'
+)
+new_exc = (
+    '    except Exception as e:\n'
+    '        # [oh-tab-port-scan] Return auto-scan page for ANY error at root GET\n'
+    '        # NOT for probe requests (X-OH-Tab-Scan:1) to avoid false-positive\n'
+    '        if (request.method == "GET" and not path\n'
+    '                and request.headers.get("x-oh-tab-scan") != "1"):\n'
+    '            from starlette.responses import HTMLResponse as _HtmlResp\n'
+    '            return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)\n'
+    '        from starlette.responses import Response as _Resp\n'
+    '        return _Resp(content=str(e), status_code=502)\n'
+    '\n'
+    '@app.api_route("/api/sandbox-port/{port}/"'
+)
+if old_exc in src:
+    src = src.replace(old_exc, new_exc, 1)
+    print('Auto-scan exception handler applied ✓')
+elif '[oh-tab-port-scan]' in src:
+    print('Exception handler already patched ✓')
+else:
+    print('WARNING: exception handler pattern not found')
+    # Diagnostic: find sandbox_port_proxy context
+    idx = src.find('sandbox_port_proxy')
+    print('Context:', repr(src[max(0,idx):idx+600]))
+
+with open(APP_PATH, 'w') as f:
+    f.write(src)
+print('Done.')
+PYEOF
+sudo docker cp /tmp/patch_port_scan_html.py openhands-app-tab:/tmp/patch_port_scan_html.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_port_scan_html.py
+
 # ─── 重启 openhands-app-tab 使所有 Python 补丁生效 ───
 echo ""
 echo ">>> 重启 openhands-app-tab 使补丁生效..."
@@ -1803,6 +1921,7 @@ sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_port_proxy.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_exposed_urls.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_rate_limiter.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_browser_store_expose.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_port_scan_html.py
 # 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发，含 browser tab fix）
 sudo docker cp openhands-app-tab:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
@@ -1822,10 +1941,11 @@ inject = (
     'FakeWS.CONNECTING=0;FakeWS.OPEN=1;FakeWS.CLOSING=2;FakeWS.CLOSED=3;'
     'window.WebSocket=function(url,proto){if(url&&url.indexOf("/sockets/events/")>=0){return new FakeWS(url,proto);}return new _WS(url,proto);};'
     'window.WebSocket.prototype=_WS.prototype;window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;'
+    'document.addEventListener("keydown",function(e){if(e.key!=="Enter")return;var el=document.activeElement;if(!el||el.tagName!=="INPUT")return;var v=el.value||"";if(!v.match(/^(https?:\\/\\/|\\/api\\/sandbox-port\\/)/))return;if(!el.closest("form"))return;e.preventDefault();el.blur();},true);'
     '})();</script>'
 )
 with open('/tmp/oh-index.html', 'w') as f: f.write(html.replace('<head>', '<head>' + inject, 1))
-print('重启后重新注入 index.html FakeWS（含 browser tab fix）✓')
+print('重启后重新注入 index.html FakeWS（含 browser tab fix + Enter键修复）✓')
 INNEREOF
 sudo docker cp /tmp/oh-index.html openhands-app-tab:/app/frontend/build/index.html 2>/dev/null || true
 REMOTE
@@ -1926,6 +2046,8 @@ echo "  - index.html FakeWS（WebSocket→EventSource→/api/proxy/events）"
 echo "  - per-conversation 工作目录隔离（每个会话独立子目录）"
 echo "  - rate limiter 修复（SSE 排除 + X-Forwarded-For，防 klogin 共享 IP 429）"
 echo "  - sandbox port proxy（Code/App tab 通过 /api/sandbox-port/ 访问，CSP stripped, remoteAuthority cleared）"
+echo "  - App tab 自动扫描端口（proxy 失败时返回 scan 页，自动跳到运行中的 app）"
+echo "  - Enter 键修复（served-tab URL bar，触发 blur 导航）"
 echo "  - exposed_urls 代理路径重写（VSCODE/WORKER URL → /api/sandbox-port/）"
 echo "  - vscode-tab URL parse fix（new URL relative path fix + z-suffix cache busting）"
 echo "  - git-service.js poll 修复（V1 新建会话直接返回真实 conversation_id）"
