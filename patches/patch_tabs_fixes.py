@@ -588,16 +588,16 @@ elif 'def _docker_exec_http(' in proxy_src:
         # Note: /proc/pid/fd readlinks restricted by ptrace scope even for root,
         # but /proc/pid/status is world-readable and os.kill() works for root.
         _sc = (
-            "import os,signal\n"
-            "try:\n"
-            "  for pid in os.listdir(\'/proc\'):\n"
-            "    if not pid.isdigit(): continue\n"
-            "    try:\n"
-            "      st=open(f\'/proc/{pid}/status\').read()\n"
-            "      if \'T (stopped)\' in st:\n"
-            "        os.kill(int(pid),signal.SIGCONT)\n"
-            "    except: pass\n"
-            "except: pass\n"
+            "import os,signal\\n"
+            "try:\\n"
+            "  for pid in os.listdir('/proc'):\\n"
+            "    if not pid.isdigit(): continue\\n"
+            "    try:\\n"
+            "      st=open(f'/proc/{pid}/status').read()\\n"
+            "      if 'T (stopped)' in st:\\n"
+            "        os.kill(int(pid),signal.SIGCONT)\\n"
+            "    except: pass\\n"
+            "except: pass\\n"
         )
         _enc = _b64.b64encode(_sc.encode()).decode()
         _exec_cmd(["python3", "-c", "import base64; exec(base64.b64decode(\'" + _enc + "\').decode())"])

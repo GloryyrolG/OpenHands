@@ -36,7 +36,7 @@ echo ">>> 配置服务器环境..."
 # Upload patch files to klogin instance before entering remote block
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo ">>> Uploading patches to $INSTANCE_ID:/tmp/ ..."
-scp -o StrictHostKeyChecking=no "$SCRIPT_DIR"/patches/*.py "$INSTANCE_ID":/tmp/
+tar czf - -C "$SCRIPT_DIR" patches/ | ssh -o StrictHostKeyChecking=no "$INSTANCE_ID" "tar xzf - -C /tmp/ --strip-components=1"
 echo "Patches uploaded ✓"
 
 ssh -o StrictHostKeyChecking=no "$INSTANCE_ID" bash << 'REMOTE'
