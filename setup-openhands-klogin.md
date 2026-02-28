@@ -61,6 +61,7 @@ bash setup-openhands-klogin-{variant}.sh
 | 12c | 目录列表 → scan HTML | `app.py` | 直接访问 workspace 文件服务器时返回扫描页而非目录列表 |
 | 12d | scan 探针拒绝目录列表 | `app.py` | scan probe 遇目录列表返回 502，跳过文件服务器端口继续扫描 |
 | 13 | scan WebSocket 代理 | `app.py` | 转发 scan 路径的 WS（Streamlit 等需要）；正确传递 subprotocol（`streamlit`） |
+| QA | proxy 代码质量改进 | `agent_server_proxy.py` + `app.py` | `lru_cache` → 60s TTL cache（stale container 后自动刷新）；`_key_cache`/`_url_cache` 加 1h TTL；Referer 正则支持 `task-` 前缀；`get_running_loop()` 替换废弃 `get_event_loop()`；PROXY_ROUTES 自包含 `_get_oh_tab_ip` import（消除 patch 顺序依赖）|
 
 ### 补丁8 详细说明：Per-Conversation 工作目录隔离
 
