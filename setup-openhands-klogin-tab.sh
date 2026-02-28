@@ -611,8 +611,12 @@ async def proxy_send_event_ws(conversation_id: str, request: Request):
 # HTTP 代理（catch-all，必须在 SSE 路由之后注册）
 @agent_proxy_router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_http(request: Request, path: str):
-    # Per-conversation routing: extract conversation_id from path
+    # Per-conversation routing: extract conversation_id from path or Referer
     m = _re_mod.search(r'conversations/([a-f0-9\-]{32,36})', path)
+    if not m:
+        # Try Referer header: browser sends Referer: .../conversations/{id} for API calls
+        _referer = request.headers.get("referer", "")
+        m = _re_mod.search(r'conversations/([a-f0-9\-]{32,36})', _referer)
     conv_id = m.group(1) if m else None
     if conv_id:
         agent_base = _get_tab_agent_url(conv_id)
@@ -1857,7 +1861,13 @@ new_return = '''        # [OH-TAB-PERSESSION] Rewrite VSCODE/WORKER URLs to use 
                 if _eu.name != 'AGENT_SERVER':
                     _parsed = _up.urlparse(_eu.url)
                     _host_port = _parsed.port or _eu.port
-                    _eu.url = f'/api/sandbox-port/{_host_port}'
+                    # For VSCODE: preserve ?folder= param (tkn injected on 403 redirect)
+                    if _eu.name == 'VSCODE':
+                        _qs = _up.parse_qs(_parsed.query)
+                        _folder = _qs.get('folder', [''])[0]
+                        _eu.url = f'/api/sandbox-port/{_host_port}/' + (f'?folder={_folder}' if _folder else '')
+                    else:
+                        _eu.url = f'/api/sandbox-port/{_host_port}'
 
         return SandboxInfo(
             id=container.name,
@@ -2317,6 +2327,304 @@ if changes > 0:
     print(f'app.py: {changes} change(s) written ✓')
 else:
     print('app.py: no changes needed')
+
+# Fix 6: VSCode folder in 403 redirect (add &folder=<workdir>)
+with open(app_path) as f:
+    src = f.read()
+old_rr2 = (
+    '                    if _tok:\n'
+    '                        from starlette.responses import RedirectResponse as _RR2\n'
+    '                        return _RR2(url=f"/api/sandbox-port/{port}/?tkn={_tok}", status_code=302)\n'
+)
+new_rr2 = (
+    '                    if _tok:\n'
+    '                        _workdir = _cdata.get("Config", {}).get("WorkingDir", "/workspace")\n'
+    '                        _folder = _workdir.lstrip("/") or "workspace"\n'
+    '                        from starlette.responses import RedirectResponse as _RR2\n'
+    '                        return _RR2(url=f"/api/sandbox-port/{port}/?tkn={_tok}&folder={_folder}", status_code=302)\n'
+)
+if old_rr2 in src:
+    src = src.replace(old_rr2, new_rr2, 1)
+    with open(app_path, 'w') as f:
+        f.write(src)
+    print('app.py: VSCode folder param added to redirect ✓')
+elif '&folder=' in src and '_workdir' in src:
+    print('app.py: VSCode folder param already present ✓')
+else:
+    print('WARNING: VSCode redirect pattern not found for folder fix')
+
+# Fix 7: _docker_exec_http with method/body/cookie support
+proxy_path = '/app/openhands/server/routes/agent_server_proxy.py'
+with open(proxy_path) as f:
+    proxy_src = f.read()
+
+NEW_EXEC_FUNC = '''
+def _docker_exec_http(container_id: str, port: int, path: str,
+                       method: str = "GET", body_bytes: bytes = b"",
+                       req_headers: dict = None) -> tuple:
+    """Proxy HTTP request via docker exec curl (for 127.0.0.1-bound apps).
+    Forwards Cookie, Content-Type, request method and body.
+    Returns (status_code, headers_dict, body_bytes, content_type_str)."""
+    import json as _j
+    url = f"http://127.0.0.1:{port}/{path}"
+    cmd = ["curl", "-s", "-m", "10", "--include", "-X", method]
+    if req_headers:
+        _cookie = req_headers.get("cookie") or req_headers.get("Cookie", "")
+        if _cookie:
+            cmd += ["-H", f"Cookie: {_cookie}"]
+        _ct_hdr = req_headers.get("content-type") or req_headers.get("Content-Type", "")
+        if _ct_hdr:
+            cmd += ["-H", f"Content-Type: {_ct_hdr}"]
+    if body_bytes:
+        try:
+            cmd += ["--data-raw", body_bytes.decode("utf-8", errors="replace")]
+        except Exception:
+            pass
+    cmd += [url]
+    exec_body = _j.dumps({
+        "Cmd": cmd, "AttachStdout": True, "AttachStderr": False, "User": "root"
+    }).encode()
+    conn = _UnixHTTPConnection("/var/run/docker.sock")
+    conn.request("POST", f"/containers/{container_id}/exec", body=exec_body,
+                 headers={"Content-Type": "application/json",
+                          "Content-Length": str(len(exec_body))})
+    resp = conn.getresponse()
+    exec_info = _j.loads(resp.read())
+    exec_id = exec_info.get("Id")
+    if not exec_id:
+        raise Exception("exec create failed")
+    start_body = b\'{"Detach":false,"Tty":false}\'
+    conn2 = _UnixHTTPConnection("/var/run/docker.sock")
+    conn2.request("POST", f"/exec/{exec_id}/start", body=start_body,
+                  headers={"Content-Type": "application/json",
+                           "Content-Length": str(len(start_body))})
+    resp2 = conn2.getresponse()
+    raw = resp2.read()
+    stdout = b""
+    pos = 0
+    while pos + 8 <= len(raw):
+        stream_type = raw[pos]
+        size = int.from_bytes(raw[pos+4:pos+8], "big")
+        if size == 0:
+            pos += 8
+            continue
+        if stream_type == 1:
+            stdout += raw[pos+8:pos+8+size]
+        pos += 8 + size
+    if b"\\r\\n\\r\\n" not in stdout:
+        raise Exception(f"no HTTP separator ({len(stdout)} bytes)")
+    headers_raw, body = stdout.split(b"\\r\\n\\r\\n", 1)
+    lines = headers_raw.split(b"\\r\\n")
+    status_code = int(lines[0].decode().split()[1]) if lines else 502
+    hdrs = {}
+    ct = ""
+    for line in lines[1:]:
+        if b": " in line:
+            k, v = line.decode().split(": ", 1)
+            hdrs[k.lower()] = v
+            if k.lower() == "content-type":
+                ct = v
+    return status_code, hdrs, body, ct
+
+'''
+
+if 'method: str = "GET"' in proxy_src:
+    print('agent_server_proxy.py: _docker_exec_http already updated ✓')
+elif '_docker_exec_http' not in proxy_src:
+    proxy_src = proxy_src.replace('def _get_oh_tab_container_for_port', NEW_EXEC_FUNC + 'def _get_oh_tab_container_for_port', 1)
+    with open(proxy_path, 'w') as f:
+        f.write(proxy_src)
+    print('agent_server_proxy.py: _docker_exec_http added ✓')
+else:
+    # Replace old GET-only version with new method/body/cookie version
+    idx = proxy_src.find('def _docker_exec_http(')
+    end_idx = proxy_src.find('\ndef ', idx + 1)
+    if idx >= 0 and end_idx > idx:
+        proxy_src = proxy_src[:idx] + NEW_EXEC_FUNC.strip() + '\n\n' + proxy_src[end_idx+1:]
+        with open(proxy_path, 'w') as f:
+            f.write(proxy_src)
+        print('agent_server_proxy.py: _docker_exec_http replaced with method/body/cookie version ✓')
+    else:
+        print('WARNING: could not find _docker_exec_http end boundary')
+
+# Fix 8: Full scan handler: docker exec with Cookie/method/body + Location rewrite + <base> tag
+with open(app_path) as f:
+    src = f.read()
+
+# 8a: httpx path - add Location rewrite + <base> tag + strip content-length
+OLD_HTTPX_RET = (
+    '                    from starlette.responses import Response as _Resp2\n'
+    '                    _scan_hdrs = {k:v for k,v in _r2.headers.multi_items()\n'
+    '                        if k.lower() not in ("content-encoding","transfer-encoding","connection","content-security-policy")}\n'
+    '                    return _Resp2(content=_r2.content, status_code=_r2.status_code,\n'
+    '                        headers=_scan_hdrs, media_type=_r2.headers.get("content-type",""))\n'
+)
+NEW_HTTPX_RET = (
+    '                    from starlette.responses import Response as _Resp2\n'
+    '                    _scan_hdrs = {k:v for k,v in _r2.headers.multi_items()\n'
+    '                        if k.lower() not in ("content-encoding","transfer-encoding","connection","content-security-policy","content-length")}\n'
+    '                    # Rewrite Location for app-internal redirects\n'
+    '                    if 300 <= _r2.status_code < 400 and "location" in _scan_hdrs:\n'
+    '                        import urllib.parse as _up3\n'
+    '                        _loc = _scan_hdrs["location"]\n'
+    '                        if _loc.startswith("http"):\n'
+    '                            _lp = _up3.urlparse(_loc)\n'
+    '                            _lpath = _lp.path.lstrip("/") + (("?" + _lp.query) if _lp.query else "")\n'
+    '                        else:\n'
+    '                            _lpath = _loc.lstrip("/")\n'
+    '                        _scan_hdrs["location"] = f"/api/sandbox-port/{port}/scan/{_sp_port}/{_lpath}"\n'
+    '                    # Rewrite root-relative URLs and inject <base> tag\n'
+    '                    _r2_content = _r2.content\n'
+    '                    _r2_ct = _r2.headers.get("content-type", "")\n'
+    '                    if "text/html" in _r2_ct and _r2_content:\n'
+    '                        import re as _re3\n'
+    '                        _sb = f"/api/sandbox-port/{port}/scan/{_sp_port}"\n'
+    '                        try:\n'
+    '                            _hs = _r2_content.decode("utf-8", errors="replace")\n'
+    '                            _hs = _re3.sub(\n'
+    '                                r\'((?:href|action|src)=")(/(?!/)[^"]*)\',\n'
+    '                                lambda m: m.group(1) + _sb + m.group(2) if not m.group(2).startswith(_sb) else m.group(0),\n'
+    '                                _hs)\n'
+    '                            _r2_content = _hs.encode("utf-8")\n'
+    '                        except Exception:\n'
+    '                            pass\n'
+    '                        _base = f\'<base href="/api/sandbox-port/{port}/scan/{_sp_port}/">\'.encode()\n'
+    '                        for _htag in (b"<head>", b"<Head>", b"<HEAD>"):\n'
+    '                            if _htag in _r2_content:\n'
+    '                                _r2_content = _r2_content.replace(_htag, _htag + _base, 1)\n'
+    '                                break\n'
+    '                        else:\n'
+    '                            _r2_content = _base + _r2_content\n'
+    '                    return _Resp2(content=_r2_content, status_code=_r2.status_code,\n'
+    '                        headers=_scan_hdrs, media_type=_r2.headers.get("content-type",""))\n'
+)
+if 'r\'((?:href|action|src)=")(/(?!/)[^"]*)\'' in src:
+    print('app.py: httpx scan URL rewrite+base tag already present ✓')
+elif 'Rewrite Location for app-internal' in src:
+    # old version without HTML rewrite, need to upgrade
+    OLD_HTTPX_RET_V2 = (
+        '                    # Inject <base> tag so relative URLs in HTML stay in scan proxy\n'
+        '                    _r2_content = _r2.content\n'
+    )
+    if OLD_HTTPX_RET_V2 in src:
+        # find the full old block and replace
+        idx = src.find(OLD_HTTPX_RET_V2)
+        end_marker = '                    return _Resp2(content=_r2_content, status_code=_r2.status_code,\n'
+        end_idx = src.find(end_marker, idx)
+        if end_idx > idx:
+            end_idx = src.find('\n', end_idx) + 1
+            src = src[:idx] + '\n'.join(NEW_HTTPX_RET.split('\n')) + src[end_idx:]
+            print('app.py: httpx scan URL rewrite upgraded ✓')
+        else:
+            print('WARNING: could not find end of old httpx HTML block')
+    else:
+        print('app.py: httpx scan Location already present (no HTML block) ✓')
+elif OLD_HTTPX_RET in src:
+    src = src.replace(OLD_HTTPX_RET, NEW_HTTPX_RET, 1)
+    print('app.py: httpx scan URL rewrite+Location+base tag fix added ✓')
+else:
+    print('WARNING: httpx scan return pattern not found')
+
+# 8b: docker exec fallback - full version with Cookie/method/body + Location + base tag
+OLD_SCAN_EXC = (
+    '                except Exception as _se:\n'
+    '                    from starlette.responses import Response as _Resp2\n'
+    '                    if request.headers.get("x-oh-tab-scan") != "1":\n'
+    '                        from starlette.responses import HTMLResponse as _HtmlResp\n'
+    '                        return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)\n'
+    '                    return _Resp2(content=str(_se), status_code=502)\n'
+)
+OLD_SCAN_EXC_V2 = (
+    '                except Exception as _se:\n'
+    '                    # Fallback: try docker exec for 127.0.0.1-bound apps\n'
+    '                    _cid2 = _cdata2.get("Id", "")\n'
+    '                    if _cid2:\n'
+    '                        try:\n'
+    '                            import asyncio as _asyncio\n'
+    '                            from openhands.server.routes.agent_server_proxy import _docker_exec_http as _deh\n'
+    '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_event_loop().run_in_executor(\n'
+    '                                None, _deh, _cid2, _sp_port, _sp_path)\n'
+    '                            _scan_hdrs2 = {k:v for k,v in _hdrs2.items()\n'
+    '                                if k.lower() not in ("content-encoding","transfer-encoding","connection","content-security-policy")}\n'
+    '                            from starlette.responses import Response as _Resp2\n'
+    '                            return _Resp2(content=_body2, status_code=_status2,\n'
+    '                                headers=_scan_hdrs2, media_type=_ct2)\n'
+    '                        except Exception:\n'
+    '                            pass\n'
+    '                    from starlette.responses import Response as _Resp2\n'
+    '                    if request.headers.get("x-oh-tab-scan") != "1":\n'
+    '                        from starlette.responses import HTMLResponse as _HtmlResp\n'
+    '                        return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)\n'
+    '                    return _Resp2(content=str(_se), status_code=502)\n'
+)
+NEW_SCAN_EXC = (
+    '                except Exception as _se:\n'
+    '                    # Fallback: try docker exec for 127.0.0.1-bound apps\n'
+    '                    _cid2 = _cdata2.get("Id", "")\n'
+    '                    if _cid2:\n'
+    '                        try:\n'
+    '                            import asyncio as _asyncio\n'
+    '                            from openhands.server.routes.agent_server_proxy import _docker_exec_http as _deh\n'
+    '                            _exec_body = await request.body()\n'
+    '                            _exec_hdrs = dict(request.headers)\n'
+    '                            _status2, _hdrs2, _body2, _ct2 = await _asyncio.get_event_loop().run_in_executor(\n'
+    '                                None, _deh, _cid2, _sp_port, _sp_path, request.method, _exec_body, _exec_hdrs)\n'
+    '                            # Rewrite Location for app-internal redirects\n'
+    '                            import urllib.parse as _up3\n'
+    '                            _loc2 = _hdrs2.get("location", "")\n'
+    '                            if _loc2:\n'
+    '                                if _loc2.startswith("http"):\n'
+    '                                    _lp2 = _up3.urlparse(_loc2)\n'
+    '                                    _lpath2 = _lp2.path.lstrip("/") + (("?" + _lp2.query) if _lp2.query else "")\n'
+    '                                else:\n'
+    '                                    _lpath2 = _loc2.lstrip("/")\n'
+    '                                _hdrs2["location"] = f"/api/sandbox-port/{port}/scan/{_sp_port}/{_lpath2}"\n'
+    '                            # Rewrite root-relative URLs and inject <base> tag\n'
+    '                            if "text/html" in _ct2 and _body2:\n'
+    '                                import re as _re3\n'
+    '                                _sb = f"/api/sandbox-port/{port}/scan/{_sp_port}"\n'
+    '                                try:\n'
+    '                                    _hs = _body2.decode("utf-8", errors="replace")\n'
+    '                                    _hs = _re3.sub(\n'
+    '                                        r\'((?:href|action|src)=")(/(?!/)[^"]*)\',\n'
+    '                                        lambda m: m.group(1) + _sb + m.group(2) if not m.group(2).startswith(_sb) else m.group(0),\n'
+    '                                        _hs)\n'
+    '                                    _body2 = _hs.encode("utf-8")\n'
+    '                                except Exception:\n'
+    '                                    pass\n'
+    '                                _base2 = f\'<base href="/api/sandbox-port/{port}/scan/{_sp_port}/">\'.encode()\n'
+    '                                for _htag2 in (b"<head>", b"<Head>", b"<HEAD>"):\n'
+    '                                    if _htag2 in _body2:\n'
+    '                                        _body2 = _body2.replace(_htag2, _htag2 + _base2, 1)\n'
+    '                                        break\n'
+    '                                else:\n'
+    '                                    _body2 = _base2 + _body2\n'
+    '                            _scan_hdrs2 = {k:v for k,v in _hdrs2.items()\n'
+    '                                if k.lower() not in ("content-encoding","transfer-encoding","connection","content-security-policy","content-length")}\n'
+    '                            from starlette.responses import Response as _Resp2\n'
+    '                            return _Resp2(content=_body2, status_code=_status2,\n'
+    '                                headers=_scan_hdrs2, media_type=_ct2)\n'
+    '                        except Exception:\n'
+    '                            pass\n'
+    '                    from starlette.responses import Response as _Resp2\n'
+    '                    if request.headers.get("x-oh-tab-scan") != "1":\n'
+    '                        from starlette.responses import HTMLResponse as _HtmlResp\n'
+    '                        return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)\n'
+    '                    return _Resp2(content=str(_se), status_code=502)\n'
+)
+if 'r\'((?:href|action|src)=")(/(?!/)[^"]*)\'' in src and 'request.method, _exec_body, _exec_hdrs' in src:
+    print('app.py: docker exec scan fallback already fully updated ✓')
+elif OLD_SCAN_EXC_V2 in src:
+    src = src.replace(OLD_SCAN_EXC_V2, NEW_SCAN_EXC, 1)
+    print('app.py: docker exec scan fallback upgraded (method/cookie/location/base) ✓')
+elif OLD_SCAN_EXC in src:
+    src = src.replace(OLD_SCAN_EXC, NEW_SCAN_EXC, 1)
+    print('app.py: docker exec scan fallback added (method/cookie/location/base) ✓')
+else:
+    print('WARNING: scan exception block pattern not found')
+
+with open(app_path, 'w') as f:
+    f.write(src)
 PYEOF
 sudo docker cp /tmp/patch_tabs_fixes.py openhands-app-tab:/tmp/patch_tabs_fixes.py
 sudo docker exec openhands-app-tab python3 /tmp/patch_tabs_fixes.py
