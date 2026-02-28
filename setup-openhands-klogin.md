@@ -46,17 +46,21 @@ bash setup-openhands-klogin-{variant}.sh
 
 | # | 补丁 | 修改文件 | 解决问题 |
 |---|------|----------|----------|
-| 1 | sandbox 复用 | `docker_sandbox_service.py` | host network 下多 sandbox 争端口 8000 → 401 |
-| 2 | agent-server 反向代理 | `agent_server_proxy.py` + `app.py` | 浏览器无法直接访问 127.0.0.1:8000 |
-| 3 | socket.io polling | `markdown-renderer-*.js`, `parse-pr-url-*.js` | V0 会话 Disconnected |
-| 4 | v1-svc.js 路由重写 | `v1-conversation-service.api-*.js` | V1 API 调用走反向代理 |
-| 5 | should-render-event SSE | `should-render-event-*.js` | V1 WebSocket→EventSource |
-| 6 | /api/proxy/events 路由 | `app.py` | klogin 只转发 /api/*，SSE 事件流走此路径 |
-| 7 | index.html FakeWS | `index.html` | 全局 WS 拦截→SSE，绕过 klogin 缓存 |
-| 8 | per-conversation workspace | `live_status_app_conversation_service.py` | 每会话独立工作目录 |
-| 2b | rate limiter 修复 | `middleware.py` | klogin 共享 IP + SSE 重连风暴导致全局 429；SSE 排除限流 + X-Forwarded-For |
-| 9 | sandbox port proxy | `app.py` | 注入 `/api/sandbox-port/{port}/*` 反代，让浏览器访问 VSCode/App tab |
+| 1 | per-session sandbox 隔离 | `docker_sandbox_service.py` | 每会话独立 sandbox 容器，消除多 sandbox 争端口 8000 → 401 |
+| 1.5 | bridge 模式网络修复 | 同上 | extra_hosts 条件修复；webhook port 从 OH_WEB_URL 读；MCP URL 换 host.docker.internal |
+| 2 | agent-server 反向代理 | `agent_server_proxy.py` + `app.py` | 浏览器无法直接访问 127.0.0.1:8000；per-conv URL 查 SQLite；per-session key 注入 |
+| 3–7 | 前端 JS + SSE 路由 | JS assets + `app.py` + `index.html` | socket.io polling；v1-svc 路由；SSE 事件流；FakeWS 全局拦截；cache busting（z-suffix） |
+| 2b | rate limiter 修复 | `middleware.py` | klogin 共享 IP + SSE 重连风暴导致全局 429；SSE 排除限流 |
+| 8 | per-conversation workspace | `live_status_app_conversation_service.py` | 每会话独立 `/workspace/project/{id}/` 子目录；git init 在 workspace root |
+| 9 | sandbox port proxy (HTTP) | `app.py` | `/api/sandbox-port/{port}/*` 反代 VSCode/App tab；Location/HTML rewrite；strip CSP |
+| 9b | 容器 bridge IP 路由 | 同上 | port<20000 → 容器 bridge IP（内部端口）；port≥20000 → 127.0.0.1（Docker NAT） |
 | 10 | exposed_urls 重写 | `docker_sandbox_service.py` | VSCODE/WORKER URL 改为 `/api/sandbox-port/{port}`；AGENT_SERVER 保持绝对 URL |
+| 11 | vscode-tab URL fix + z-suffix | JS assets | VSCode URL parse 修复；z-suffix rename 绕过 immutable 30d 浏览器缓存 |
+| 12a | App tab 自动端口扫描 | `app.py` | 访问 App tab 无 app 时返回扫描页；自动探测并跳转到 AI 启动的 app 端口 |
+| 12b | scan proxy 完整支持 | `app.py` | docker exec fallback（loopback app）；HTML URL 重写；Cookie 转发；stateful app 支持 |
+| 12c | 目录列表 → scan HTML | `app.py` | 直接访问 workspace 文件服务器时返回扫描页而非目录列表 |
+| 12d | scan 探针拒绝目录列表 | `app.py` | scan probe 遇目录列表返回 502，跳过文件服务器端口继续扫描 |
+| 13 | scan WebSocket 代理 | `app.py` | 转发 scan 路径的 WS（Streamlit 等需要）；正确传递 subprotocol（`streamlit`） |
 
 ### 补丁8 详细说明：Per-Conversation 工作目录隔离
 
@@ -187,33 +191,31 @@ https://{INGRESS_NAME}.svc.<instance-id>.klogin-user.mlplatform.apple.com
 
 需要 AppleConnect 认证，浏览器会自动弹出。
 
-### Agent 启动的 App 分享给同事（Streamlit / Gradio 等）
+### Agent 启动的 App（Streamlit / Gradio / Flask 等）
 
-`/api/sandbox-port/` 代理对 WebSocket 密集型 app（如 Streamlit）不可靠（klogin 剥离 WS Upgrade 头）。
-**正确方案：klogin ingress 直连端口。**
+**App tab 自动扫描**（补丁 12a–13）：打开侧边栏 App tab 时，代理会自动扫描常用端口（3000、5000、7860、8000、8080、8501–8504 等），找到 AI 启动的 app 后自动跳转。支持：
+- Streamlit（WebSocket subprotocol `streamlit` 自动转发）
+- Flask、Gradio 等 HTTP/WS app
+- 有 session/redirect 的 stateful app（Cookie 转发、Location 重写）
 
-**一次性准备**（预留端口池 8500–8509）：
+> **App 进程生命周期**：容器 `docker restart` 保留文件，但用户启动的 app 进程不会自动恢复，需在对话中让 AI 重新运行，或手动 `docker exec -d ... python3 app.py`。
+
+**分享给同事（可选，使用 klogin ingress 直连）**：
 
 ```bash
-# 开放防火墙
+# 开放防火墙端口池
 ssh <instance-id> "sudo ufw allow 8500:8509/tcp"
 
 # 批量创建 ingress（本地运行）
 for port in $(seq 8500 8509); do
   klogin ingresses create app${port} \
-    --instance <instance-id> \
-    --port ${port} \
-    --access-control=false \
-    -I
+    --instance <instance-id> --port ${port} --access-control=false -I
 done
 ```
 
-访问地址格式：`https://app8501.svc.<instance-id>.klogin-user.mlplatform.apple.com`
+访问格式：`https://app8501.svc.<instance-id>.klogin-user.mlplatform.apple.com`
 
-**使用方式**：让 agent 把 app 启动在 8500–8509 中任意一个端口，把对应 URL 发给同事即可。
-需要换 app 时，停掉旧进程，在同一端口启新 app，URL 不变。
-
-> **注意**：UFW 必须提前开放对应端口，否则 klogin health probe 探活失败，ingress 显示 `READY=false`，访问返回 503。
+> **注意**：UFW 必须提前开放对应端口，否则 klogin health probe 失败，ingress 返回 503。
 
 ### SSH 本地隧道
 
