@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "=== OpenHands on klogin 一键部署 ==="
+echo "=== OpenHands on klogin 一键部署 [tab-display] ==="
 echo ""
 
 # 1. 获取实例列表
@@ -45,8 +45,8 @@ fi
 echo "Docker 已安装 ✓"
 
 # 开放防火墙端口（ingress 直连模式需要）
-sudo ufw allow 3000
-echo "ufw allow 3000 ✓"
+sudo ufw allow 3003
+echo "ufw allow 3003 ✓"
 
 # 配置 host.docker.internal（必须用 hostname -I，不能用 ifconfig.me）
 EXTERNAL_IP=$(hostname -I | awk '{print $1}')
@@ -56,23 +56,23 @@ echo "$EXTERNAL_IP host.docker.internal" | sudo tee -a /etc/hosts
 echo "hosts 配置完成 ✓"
 
 # 清理旧 agent-server 和主容器（防止 401 认证冲突）
-sudo docker ps -a --filter name=oh-agent-server -q | xargs -r sudo docker rm -f 2>/dev/null || true
-sudo docker rm -f openhands-app 2>/dev/null || true
+sudo docker ps -a --filter name=oh-tab- -q | xargs -r sudo docker rm -f 2>/dev/null || true
+sudo docker rm -f openhands-app-tab 2>/dev/null || true
 
 # 启动 OpenHands（不要加 OH_SECRET_KEY，否则 agent-server 认证会 401）
 echo ">>> 启动 OpenHands..."
 sudo docker run -d --pull=always \
-  --name openhands-app \
+  --name openhands-app-tab \
   --network host \
   -e AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server \
   -e AGENT_SERVER_IMAGE_TAG=1.10.0-python \
   -e LOG_ALL_EVENTS=true \
   -e SANDBOX_STARTUP_GRACE_SECONDS=120 \
   -e SANDBOX_USE_HOST_NETWORK=true \
-  -e AGENT_SERVER_PORT_RANGE_START=12000 \
-  -e AGENT_SERVER_PORT_RANGE_END=13000 \
+  -e AGENT_SERVER_PORT_RANGE_START=14000 \
+  -e AGENT_SERVER_PORT_RANGE_END=15000 \
   -e 'SANDBOX_CONTAINER_URL_PATTERN=http://127.0.0.1:{port}' \
-  -e OH_WEB_URL='http://127.0.0.1:3000' \
+  -e OH_WEB_URL='http://127.0.0.1:3003' \
   -e ENABLE_MCP=false \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v ~/.openhands:/.openhands \
@@ -81,11 +81,11 @@ sudo docker run -d --pull=always \
 # 等待启动
 echo "等待 OpenHands 启动..."
 for i in $(seq 1 30); do
-    if sudo docker logs openhands-app 2>&1 | grep -q "Uvicorn running"; then
+    if sudo docker logs openhands-app-tab 2>&1 | grep -q "Uvicorn running"; then
         echo "OpenHands 启动成功 ✓"
         break
     fi
-    [ "$i" -eq 30 ] && echo "警告: 等待超时，请手动确认: sudo docker logs openhands-app"
+    [ "$i" -eq 30 ] && echo "警告: 等待超时，请手动确认: sudo docker logs openhands-app-tab"
     sleep 2
 done
 
@@ -119,9 +119,24 @@ if old in src:
     print('sandbox 补丁已应用（host network 复用 sandbox）✓')
 else:
     print('警告: sandbox 补丁 pattern 未匹配，跳过')
+
+# 修改 agent-server 容器前缀，避免与其他 openhands 实例冲突
+prefix_old = "container_name_prefix: str = 'oh-agent-server-'"
+prefix_new = "container_name_prefix: str = 'oh-tab-'"
+with open(path) as f:
+    src2 = f.read()
+if prefix_new in src2:
+    print("container_name_prefix 'oh-tab-' 已存在 ✓")
+elif prefix_old in src2:
+    src2 = src2.replace(prefix_old, prefix_new, 1)
+    with open(path, 'w') as f:
+        f.write(src2)
+    print("container_name_prefix 改为 'oh-tab-' ✓")
+else:
+    print('警告: container_name_prefix pattern 未匹配，跳过')
 PYEOF
-sudo docker cp /tmp/patch_sandbox.py openhands-app:/tmp/patch_sandbox.py
-SANDBOX_RESULT=$(sudo docker exec openhands-app python3 /tmp/patch_sandbox.py 2>&1)
+sudo docker cp /tmp/patch_sandbox.py openhands-app-tab:/tmp/patch_sandbox.py
+SANDBOX_RESULT=$(sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox.py 2>&1)
 echo "$SANDBOX_RESULT"
 
 # ─── 补丁2：agent-server 反向代理路由（修复 V1 Disconnected + 消息无响应）───
@@ -162,10 +177,10 @@ class _UnixHTTPConnection(_http_client.HTTPConnection):
 
 @_ft.lru_cache(maxsize=1)
 def _get_agent_server_key() -> str:
-    """Read session_api_key from oh-agent-server via Docker API (Unix socket)."""
+    """Read session_api_key from oh-tab- container via Docker API (Unix socket)."""
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
-        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-agent-server%22%5D%7D")
+        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-tab-%22%5D%7D")
         resp = conn.getresponse()
         containers = _json_mod.loads(resp.read())
         if not containers:
@@ -289,6 +304,11 @@ async def proxy_http(request: Request, path: str):
                                         params=params, headers=headers, content=body)
             resp_headers = {k: v for k, v in resp.headers.items()
                            if k.lower() not in ("content-encoding", "transfer-encoding", "connection")}
+            # Changes tab: agent-server returns 500 when git state is broken/unavailable.
+            # Return [] instead of propagating 500 so the UI shows empty changes gracefully.
+            if resp.status_code == 500 and path.startswith("api/git/changes"):
+                return Response(content="[]", status_code=200,
+                                media_type="application/json")
             return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as e:
         return Response(content=str(e), status_code=502)
@@ -312,9 +332,9 @@ else:
     print('app.py 代理路由已注入 ✓')
 PYEOF
 
-sudo docker cp /tmp/agent_server_proxy.py openhands-app:/app/openhands/server/routes/agent_server_proxy.py
-sudo docker cp /tmp/patch_app.py openhands-app:/tmp/patch_app.py
-sudo docker exec openhands-app python3 /tmp/patch_app.py
+sudo docker cp /tmp/agent_server_proxy.py openhands-app-tab:/app/openhands/server/routes/agent_server_proxy.py
+sudo docker cp /tmp/patch_app.py openhands-app-tab:/tmp/patch_app.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_app.py
 
 # ─── 补丁2b：rate limiter 修复（klogin 共享 IP + SSE 重连风暴）───
 # 根因1：klogin 所有请求共用同一代理 IP，per-IP 10req/s 限流会误杀正常请求。
@@ -368,8 +388,8 @@ else:
 with open('/app/openhands/server/middleware.py', 'w') as f:
     f.write(src)
 PYEOF
-sudo docker cp /tmp/patch_rate_limiter.py openhands-app:/tmp/patch_rate_limiter.py
-sudo docker exec openhands-app python3 /tmp/patch_rate_limiter.py
+sudo docker cp /tmp/patch_rate_limiter.py openhands-app-tab:/tmp/patch_rate_limiter.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_rate_limiter.py
 
 # ─── 补丁2c：CacheControlMiddleware 改为 no-cache（防止浏览器将 JS 资产缓存为 immutable）───
 # 根因：middleware.py 的 CacheControlMiddleware 对所有 /assets/*.js 设置 immutable(max-age=30d)，
@@ -393,18 +413,18 @@ else:
         f.write(src)
     print('CacheControlMiddleware: immutable → no-cache, must-revalidate ✓')
 PYEOF
-sudo docker cp /tmp/patch_cache_control.py openhands-app:/tmp/patch_cache_control.py
-sudo docker exec openhands-app python3 /tmp/patch_cache_control.py
+sudo docker cp /tmp/patch_cache_control.py openhands-app-tab:/tmp/patch_cache_control.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_cache_control.py
 
 # ─── 补丁3：socket.io polling（修复 V0 会话 Disconnected）───
 # klogin 会剥离 WebSocket Upgrade 头，改为 polling+websocket 顺序，先用 polling
 for JS_ASSET in markdown-renderer-Ci-ahARR.js parse-pr-url-BOXiVwNz.js; do
     JS_FILE=/tmp/oh-patch-${JS_ASSET}
-    sudo docker cp openhands-app:/app/frontend/build/assets/${JS_ASSET} $JS_FILE 2>/dev/null || continue
+    sudo docker cp openhands-app-tab:/app/frontend/build/assets/${JS_ASSET} $JS_FILE 2>/dev/null || continue
     sudo chmod 666 $JS_FILE
     if ! grep -q 'polling.*websocket' $JS_FILE 2>/dev/null; then
         sudo sed -i 's/transports:\["websocket"\]/transports:["polling","websocket"]/g' $JS_FILE
-        sudo docker cp $JS_FILE openhands-app:/app/frontend/build/assets/${JS_ASSET}
+        sudo docker cp $JS_FILE openhands-app-tab:/app/frontend/build/assets/${JS_ASSET}
         echo "socket.io polling 补丁已应用: ${JS_ASSET} ✓"
     else
         echo "socket.io polling 补丁已存在: ${JS_ASSET} ✓"
@@ -413,7 +433,7 @@ done
 
 # ─── 补丁4：v1-conversation-service.js 路由改为走反向代理 ───
 # C() 和 $() 函数改为使用 window.location.host/agent-server-proxy，
-# 这样浏览器的所有 agent-server 调用都走 openhands-app（port 3000），可通过 klogin
+# 这样浏览器的所有 agent-server 调用都走 openhands-app-tab（port 3003），可通过 klogin
 cat > /tmp/patch_v1svc.py << 'PYEOF'
 path = '/app/frontend/build/assets/v1-conversation-service.api-BE_2IImp.js'
 with open(path) as f:
@@ -443,8 +463,8 @@ if ok:
         f.write(src)
     print('v1-svc.js 路由补丁已应用 ✓')
 PYEOF
-sudo docker cp /tmp/patch_v1svc.py openhands-app:/tmp/patch_v1svc.py
-sudo docker exec openhands-app python3 /tmp/patch_v1svc.py
+sudo docker cp /tmp/patch_v1svc.py openhands-app-tab:/tmp/patch_v1svc.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_v1svc.py
 
 # ─── 补丁5：should-render-event.js（已废弃，由 index.html FakeWS 全局 override window.WebSocket）───
 # index.html 的 patch 7 已全局覆盖 window.WebSocket，should-render-event.js 内的 new WebSocket(L)
@@ -474,8 +494,8 @@ else:
     else:
         print('BMHPx.js 已是原版 ✓')
 PYEOF
-sudo docker cp /tmp/patch_sre.py openhands-app:/tmp/patch_sre.py
-sudo docker exec openhands-app python3 /tmp/patch_sre.py
+sudo docker cp /tmp/patch_sre.py openhands-app-tab:/tmp/patch_sre.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sre.py
 
 # ─── 补丁5b：cache busting — 重命名已修改的 JS 文件（bust proxy/browser immutable cache）───
 # should-render-event → BMHPx, conversation-fHdubO7R → Rx, manifest → x, 更新 index.html
@@ -587,8 +607,69 @@ elif 'manifest-8c9a7105x.js' in idx or 'manifest-8c9a7105.js' in idx:
 
 print('cache busting 完成 ✓')
 PYEOF
-sudo docker cp /tmp/patch_cache_bust.py openhands-app:/tmp/patch_cache_bust.py
-sudo docker exec openhands-app python3 /tmp/patch_cache_bust.py
+sudo docker cp /tmp/patch_cache_bust.py openhands-app-tab:/tmp/patch_cache_bust.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_cache_bust.py
+
+# ─── 补丁12：browser store 全局暴露（修复 Browser tab 截图不更新）───
+# 根因：V1 browse observation 事件 (BrowserObservation/browse) 经 FakeWS 传递给前端，
+#       但 useBrowserStore (Zustand) 不在 window 作用域，FakeWS 无法直接调用 setScreenshotSrc。
+# 修复：在包含 screenshotSrc 初始状态的 JS bundle 末尾注入
+#       window.__oh_browser_store = <store_var>，使 FakeWS 可访问 Zustand store。
+cat > /tmp/patch_browser_store_expose.py << 'PYEOF'
+import glob, re, os
+
+ASSETS = '/app/frontend/build/assets/'
+patched_files = []
+
+for js_file in sorted(glob.glob(f'{ASSETS}*.js')):
+    try:
+        with open(js_file) as f:
+            src = f.read()
+    except Exception:
+        continue
+    if 'screenshotSrc' not in src:
+        continue
+    if '__oh_browser_store' in src:
+        print(f'Already exposed in {os.path.basename(js_file)} ✓')
+        patched_files.append(js_file)
+        continue
+
+    # Find the store variable: look for screenshotSrc:"" (initial empty state)
+    idx = src.find('screenshotSrc:""')
+    if idx < 0:
+        idx = src.find("screenshotSrc:''")
+    if idx < 0:
+        continue
+
+    # Scan backwards up to 2000 chars for: VARNAME = FUNC(
+    prefix = src[max(0, idx - 2000):idx]
+    matches = list(re.finditer(
+        r'(?:^|[;{,\(\s])([A-Za-z_$][A-Za-z0-9_$]{1,20})\s*=\s*[A-Za-z_$][A-Za-z0-9_$]{1,20}\s*\(',
+        prefix
+    ))
+    if not matches:
+        print(f'Found screenshotSrc in {os.path.basename(js_file)} but could not identify store var')
+        continue
+
+    store_var = matches[-1].group(1)
+    print(f'Identified browser store var: {store_var} in {os.path.basename(js_file)}')
+
+    expose_code = (
+        f'\ntry{{if(typeof {store_var}!=="undefined"&&{store_var}.getState)'
+        f'{{window.__oh_browser_store={store_var};'
+        f'if(window.__oh_browse&&window._ohApplyBrowse)window._ohApplyBrowse();'
+        f'console.log("[OH] browser store exposed");}}}}catch(e){{}}\n'
+    )
+    with open(js_file, 'w') as f:
+        f.write(src + expose_code)
+    print(f'Browser store exposed in {os.path.basename(js_file)} ✓')
+    patched_files.append(js_file)
+
+if not patched_files:
+    print('WARNING: Could not expose browser store - browser tab screenshots may not update')
+PYEOF
+sudo docker cp /tmp/patch_browser_store_expose.py openhands-app-tab:/tmp/patch_browser_store_expose.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_browser_store_expose.py
 
 # ─── 补丁6：app.py 注入 /api/proxy/events 路由（klogin 转发 /api/*）───
 # klogin 只转发 /api/* 和 /socket.io/*。
@@ -671,15 +752,15 @@ with open('/app/openhands/server/app.py', 'w') as f:
     f.write(src)
 print('api/proxy/events 路由已注入 ✓')
 PYEOF
-sudo docker cp /tmp/patch_api_proxy_events.py openhands-app:/tmp/patch_api_proxy_events.py
-sudo docker exec openhands-app python3 /tmp/patch_api_proxy_events.py
+sudo docker cp /tmp/patch_api_proxy_events.py openhands-app-tab:/tmp/patch_api_proxy_events.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_api_proxy_events.py
 
 # ─── 补丁7：index.html 注入全局 WebSocket/fetch 拦截器 ───
 # klogin 代理层会缓存 /assets/*.js，补丁可能对浏览器不生效。
 # index.html 设置了 no-store，每次都新鲜，是最可靠的注入点。
 # FakeWS: 拦截 /sockets/events/ WebSocket → EventSource → /api/proxy/events/{id}/stream
 # send(): 用 /api/proxy/conversations/{id}/events（klogin 可转发）
-sudo docker cp openhands-app:/app/frontend/build/index.html /tmp/oh-index.html
+sudo docker cp openhands-app-tab:/app/frontend/build/index.html /tmp/oh-index.html
 sudo chmod 666 /tmp/oh-index.html
 python3 << 'PYEOF'
 import re
@@ -691,15 +772,31 @@ if 'FakeWS' in html:
     print('旧 FakeWS 已移除')
 inject = (
     '<script>(function(){'
+    # Fetch interceptor: rewrite 127.0.0.1:8000 → /agent-server-proxy
     'var _f=window.fetch;window.fetch=function(u,o){'
     'if(typeof u==="string"&&u.indexOf("127.0.0.1:8000")>=0)'
     '{u=u.replace(/https?:\\/\\/127\\.0\\.0\\.1:8000/,"/agent-server-proxy");}'
     'return _f.call(this,u,o);};'
+    # XHR interceptor: same rewrite
     'var _X=window.XMLHttpRequest.prototype.open;'
     'window.XMLHttpRequest.prototype.open=function(m,u){'
     'if(typeof u==="string"&&u.indexOf("127.0.0.1:8000")>=0)'
     '{u=u.replace(/https?:\\/\\/127\\.0\\.0\\.1:8000/,"/agent-server-proxy");}'
     'return _X.apply(this,arguments);};'
+    # Browser tab fix helpers: store pending browse data; apply via _ohApplyBrowse()
+    # window.__oh_browser_store is exposed by patch 12 (browser-store JS chunk).
+    'window.__oh_browse=null;'
+    'window._ohApplyBrowse=function(){'
+    'var d=window.__oh_browse;'
+    'if(!d)return;'
+    'var bs=window.__oh_browser_store;'
+    'if(bs&&bs.getState){'
+    'window.__oh_browse=null;'
+    'var ss=d.ss;'
+    'if(ss){bs.getState().setScreenshotSrc(ss.startsWith("data:")?ss:"data:image/png;base64,"+ss);}'
+    'if(d.url){bs.getState().setUrl(d.url);}'
+    '}else{setTimeout(window._ohApplyBrowse,300);}'  # retry until store is loaded
+    '};'
     'var _WS=window.WebSocket;'
     'function FakeWS(url,proto){'
     'var self=this;self.readyState=0;self.onopen=null;self.onmessage=null;self.onclose=null;self.onerror=null;self._es=null;'
@@ -723,6 +820,19 @@ inject = (
     'es.onmessage=function(ev){'
     'if(ev.data==="__connected__")return;'
     'if(ev.data==="__closed__"){self.readyState=3;if(self.onclose)self.onclose({code:1000,wasClean:true});return;}'
+    # Browser tab fix: detect browse observations (V1 and V0 formats), update store
+    'try{'
+    'var _d=JSON.parse(ev.data);'
+    'var _ss="",_url="";'
+    # V1 format: observation is {kind:"BrowserObservation", screenshot_data:..., url:...}
+    'if(_d&&_d.observation&&typeof _d.observation==="object"&&_d.observation.kind==="BrowserObservation"){'
+    '_ss=_d.observation.screenshot_data||"";_url=_d.observation.url||"";}'
+    # V0 format: observation is string "browse"/"browse_interactive", extras.screenshot
+    'else if(_d&&(_d.observation==="browse"||_d.observation==="browse_interactive")){'
+    '_ss=(_d.extras&&_d.extras.screenshot)||"";_url=(_d.extras&&_d.extras.url)||"";}'
+    'if(_ss||_url){window.__oh_browse={ss:_ss,url:_url};window._ohApplyBrowse();}'
+    '}'
+    'catch(e){}'
     'if(self.onmessage)self.onmessage({data:ev.data});};'
     'es.onerror=function(){'
     'if(self._es){self._es.close();self._es=null;}'
@@ -741,7 +851,7 @@ with open('/tmp/oh-index.html', 'w') as f:
     f.write(html)
 print('index.html FakeWS 已注入（使用 /api/proxy/events/ 路径）✓')
 PYEOF
-sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html
+sudo docker cp /tmp/oh-index.html openhands-app-tab:/app/frontend/build/index.html
 
 # ─── 补丁8：per-conversation 工作目录隔离 ───
 # 根因：host network sandbox 复用导致所有 V1 会话共用 /workspace/project/，互相可见文件。
@@ -808,12 +918,12 @@ with open(path, 'w') as f:
     f.write(src)
 print('per-conversation workspace 补丁已应用 ✓')
 PYEOF
-sudo docker cp /tmp/patch_per_conv_workspace.py openhands-app:/tmp/patch_per_conv_workspace.py
-sudo docker exec openhands-app python3 /tmp/patch_per_conv_workspace.py
+sudo docker cp /tmp/patch_per_conv_workspace.py openhands-app-tab:/tmp/patch_per_conv_workspace.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_per_conv_workspace.py
 
 # ─── 补丁9：sandbox port proxy（Code/App tab 浏览器访问）───
 # VSCode (8001), App 预览 (8011/8012) 的 URL 是 http://127.0.0.1:{port}，
-# 浏览器无法通过 klogin 访问。在 openhands-app 注入 /api/sandbox-port/{port}/* 代理路由。
+# 浏览器无法通过 klogin 访问。在 openhands-app-tab 注入 /api/sandbox-port/{port}/* 代理路由。
 cat > /tmp/patch_sandbox_port_proxy.py << 'PYEOF'
 """Patch 9: Add /api/sandbox-port/{port}/{path} reverse proxy for VSCode/App tabs."""
 path = '/app/openhands/server/app.py'
@@ -835,7 +945,7 @@ PROXY_ROUTES = '''
 from fastapi import WebSocket as _FastAPIWebSocket
 @app.api_route("/api/sandbox-port/{port}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"], include_in_schema=False)
 async def sandbox_port_proxy(port: int, path: str, request: Request):
-    """Reverse proxy any sandbox port through openhands-app (port 3000)."""
+    """Reverse proxy any sandbox port through openhands-app-tab (port 3003)."""
     import httpx as _hx, re as _re
     target = f"http://127.0.0.1:{port}/{path}"
     qs = str(request.query_params)
@@ -949,8 +1059,8 @@ with open(path, 'w') as f:
     f.write(src)
 print('sandbox-port 代理路由已注入 ✓')
 PYEOF
-sudo docker cp /tmp/patch_sandbox_port_proxy.py openhands-app:/tmp/patch_sandbox_port_proxy.py
-sudo docker exec openhands-app python3 /tmp/patch_sandbox_port_proxy.py
+sudo docker cp /tmp/patch_sandbox_port_proxy.py openhands-app-tab:/tmp/patch_sandbox_port_proxy.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_port_proxy.py
 
 # ─── 补丁10：exposed_urls 代理路径重写（VSCODE/WORKER → /api/sandbox-port/）───
 # _container_to_sandbox_info() 返回的 exposed_urls 中 VSCODE/WORKER 是 http://127.0.0.1:{port}，
@@ -998,8 +1108,8 @@ with open(path, 'w') as f:
     f.write(src)
 print('exposed_urls 代理路径补丁已应用（保留 AGENT_SERVER 不变）✓')
 PYEOF
-sudo docker cp /tmp/patch_sandbox_exposed_urls.py openhands-app:/tmp/patch_sandbox_exposed_urls.py
-sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
+sudo docker cp /tmp/patch_sandbox_exposed_urls.py openhands-app-tab:/tmp/patch_sandbox_exposed_urls.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_exposed_urls.py
 
 # ─── 补丁11：vscode-tab JS 修复 + z-suffix cache busting ───
 # 根因：new URL(r.url) 当 r.url 是相对路径时抛 TypeError → "Error parsing URL"
@@ -1100,38 +1210,38 @@ if os.path.exists(mz):
 
 print('Chain: manifest-z → fHdubO7Rz → uXvJtyCLz → BMHPx + vscode-tab-z ✓')
 PYEOF
-sudo docker cp /tmp/patch_vscode_tab.py openhands-app:/tmp/patch_vscode_tab.py
-sudo docker exec openhands-app python3 /tmp/patch_vscode_tab.py
+sudo docker cp /tmp/patch_vscode_tab.py openhands-app-tab:/tmp/patch_vscode_tab.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_vscode_tab.py
 
-# ─── 重启 openhands-app 使所有 Python 补丁生效 ───
+# ─── 重启 openhands-app-tab 使所有 Python 补丁生效 ───
 echo ""
-echo ">>> 重启 openhands-app 使补丁生效..."
-sudo docker restart openhands-app
+echo ">>> 重启 openhands-app-tab 使补丁生效..."
+sudo docker restart openhands-app-tab
 for i in $(seq 1 30); do
-    sudo docker logs openhands-app 2>&1 | grep -q "Uvicorn running" && echo "重启完成 ✓" && break
+    sudo docker logs openhands-app-tab 2>&1 | grep -q "Uvicorn running" && echo "重启完成 ✓" && break
     sleep 2
 done
 
 # 重启后重新注入 JS 补丁（docker restart 保留 writable layer，但做一次确认）
 for JS_ASSET in markdown-renderer-Ci-ahARR.js parse-pr-url-BOXiVwNz.js; do
     JS_TMP=/tmp/oh-patch-${JS_ASSET}
-    sudo docker cp openhands-app:/app/frontend/build/assets/${JS_ASSET} $JS_TMP 2>/dev/null || continue
+    sudo docker cp openhands-app-tab:/app/frontend/build/assets/${JS_ASSET} $JS_TMP 2>/dev/null || continue
     sudo chmod 666 $JS_TMP
     grep -q 'polling.*websocket' $JS_TMP 2>/dev/null || {
         sudo sed -i 's/transports:\["websocket"\]/transports:["polling","websocket"]/g' $JS_TMP
-        sudo docker cp $JS_TMP openhands-app:/app/frontend/build/assets/${JS_ASSET}
+        sudo docker cp $JS_TMP openhands-app-tab:/app/frontend/build/assets/${JS_ASSET}
         echo "重启后重新注入 polling 补丁: ${JS_ASSET}"
     }
 done
-sudo docker exec openhands-app python3 /tmp/patch_v1svc.py
-sudo docker exec openhands-app python3 /tmp/patch_sre.py
-sudo docker exec openhands-app python3 /tmp/patch_api_proxy_events.py
-sudo docker exec openhands-app python3 /tmp/patch_per_conv_workspace.py
-sudo docker exec openhands-app python3 /tmp/patch_sandbox_port_proxy.py
-sudo docker exec openhands-app python3 /tmp/patch_sandbox_exposed_urls.py
-sudo docker exec openhands-app python3 /tmp/patch_rate_limiter.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_v1svc.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sre.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_api_proxy_events.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_per_conv_workspace.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_port_proxy.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_exposed_urls.py
+sudo docker exec openhands-app-tab python3 /tmp/patch_rate_limiter.py
 # 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发）
-sudo docker cp openhands-app:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
+sudo docker cp openhands-app-tab:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
 python3 /tmp/update_fakews.py 2>/dev/null || python3 << 'INNEREOF'
 import re
@@ -1144,7 +1254,7 @@ inject = (
 with open('/tmp/oh-index.html', 'w') as f: f.write(html.replace('<head>', '<head>' + inject, 1))
 print('重启后重新注入 index.html FakeWS ✓')
 INNEREOF
-sudo docker cp /tmp/oh-index.html openhands-app:/app/frontend/build/index.html 2>/dev/null || true
+sudo docker cp /tmp/oh-index.html openhands-app-tab:/app/frontend/build/index.html 2>/dev/null || true
 REMOTE
 
 # 4. 配置 klogin ingress（域名访问，只需运行一次）
@@ -1153,20 +1263,20 @@ echo ">>> 配置 klogin ingress..."
 # 确保实例有静态 IP（ingress 必需）
 klogin instances update "$INSTANCE_ID" --static-ip 2>/dev/null && echo "静态 IP 已设置 ✓" || echo "静态 IP 已存在或设置失败（可忽略）"
 # 创建 ingress（已存在则跳过）
-klogin ingresses create openhands --instance "$INSTANCE_ID" --port 3000 --access-control=false 2>/dev/null \
+klogin ingresses create openhands-tab --instance "$INSTANCE_ID" --port 3003 --access-control=false 2>/dev/null \
   && echo "ingress 创建成功 ✓" \
-  || echo "ingress 已存在或创建失败（可忽略，域名: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com）"
+  || echo "ingress 已存在或创建失败（可忽略，域名: https://openhands-tab.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com）"
 
 # 5. 建立本地 SSH 隧道并验证
 echo ""
 echo ">>> 建立本地隧道并验证..."
 pkill -f "ssh.*-L 3001.*$INSTANCE_ID" 2>/dev/null || true
 sleep 1
-ssh -f -N -L 3001:127.0.0.1:3000 "$INSTANCE_ID"
+ssh -f -N -L 3004:127.0.0.1:3003 "$INSTANCE_ID"
 sleep 2
 
 echo "测试 API 连通性..."
-HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3001/api/options/models)
+HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3004/api/options/models)
 if [ "$HTTP_CODE" != "200" ]; then
     echo "警告: API 返回 $HTTP_CODE，请检查 OpenHands 是否启动"
 else
@@ -1174,17 +1284,17 @@ else
 fi
 
 echo "测试代理路由..."
-PROXY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3001/agent-server-proxy/health)
+PROXY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3004/agent-server-proxy/health)
 [ "$PROXY_CODE" = "200" ] && echo "agent-server 代理路由 ✓" || echo "警告: 代理路由返回 $PROXY_CODE"
 
 echo "测试 sandbox port proxy（Code/App tab）..."
-SPORT_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3001/api/sandbox-port/8001/")
+SPORT_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3004/api/sandbox-port/8001/")
 [ "$SPORT_CODE" = "200" ] || [ "$SPORT_CODE" = "302" ] || [ "$SPORT_CODE" = "403" ] && \
   echo "sandbox port proxy 路由 ✓（HTTP $SPORT_CODE）" || \
   echo "警告: sandbox port proxy 返回 $SPORT_CODE（正常情况需等 sandbox 启动后才能访问）"
 
 echo "测试新建 V1 会话（浏览器路径）..."
-CONV_V1_RESP=$(curl -s -X POST http://localhost:3001/api/v1/app-conversations \
+CONV_V1_RESP=$(curl -s -X POST http://localhost:3004/api/v1/app-conversations \
   -H 'Content-Type: application/json' \
   -d '{"initial_user_msg": "hello"}')
 CONV_V1_ID=$(echo "$CONV_V1_RESP" | python3 -c \
@@ -1201,7 +1311,7 @@ fi
 echo "等待 V1 会话就绪..."
 if [ -n "$CONV_V1_ID" ]; then
     for i in $(seq 1 40); do
-        STATUS_INFO=$(curl -s "http://localhost:3001/api/conversations/$CONV_V1_ID" | \
+        STATUS_INFO=$(curl -s "http://localhost:3004/api/conversations/$CONV_V1_ID" | \
           python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''), d.get('runtime_status',''))" 2>/dev/null || true)
         if echo "$STATUS_INFO" | grep -q "RUNNING.*READY"; then
             echo "会话就绪 ✓"
@@ -1214,12 +1324,12 @@ fi
 
 echo "测试 /api/proxy/events SSE 事件流（V1 Connected 依赖，klogin 转发路径）..."
 CONV_ID="$CONV_V1_ID"
-API_KEY=$(curl -s "http://localhost:3001/api/conversations/$CONV_ID" | \
+API_KEY=$(curl -s "http://localhost:3004/api/conversations/$CONV_ID" | \
   python3 -c "import sys,json; print(json.load(sys.stdin).get('session_api_key',''))" 2>/dev/null || true)
 if [ -n "$CONV_ID" ] && [ -n "$API_KEY" ]; then
     SSE_FIRST=$(curl -s -N --max-time 5 \
       -H 'Accept: text/event-stream' \
-      "http://localhost:3001/api/proxy/events/$CONV_ID/stream?resend_all=true&session_api_key=$API_KEY" \
+      "http://localhost:3004/api/proxy/events/$CONV_ID/stream?resend_all=true&session_api_key=$API_KEY" \
       2>/dev/null | head -2)
     if echo "$SSE_FIRST" | grep -q '__connected__\|full_state'; then
         echo "SSE 事件流正常 ✓（浏览器 V1 会话将显示 Connected）"
@@ -1250,8 +1360,8 @@ echo "  - task-nav-fix（index.html 兜底脚本，确保浏览器缓存情况�
 echo "  - cache busting z-suffix（manifest/conversation JS 全新 URL，清除旧 immutable 缓存）"
 echo ""
 echo "访问方式："
-echo "  域名（推荐）: https://openhands.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com"
-echo "  本地隧道:     http://localhost:3001  (隧道已在后台运行)"
+echo "  域名（推荐）: https://openhands-tab.svc.${INSTANCE_ID}.klogin-user.mlplatform.apple.com"
+echo "  本地隧道:     http://localhost:3004  (隧道已在后台运行)"
 echo ""
 echo "同事访问域名无需任何隧道，AppleConnect 认证即可。"
 echo "下一步: 打开上方任意地址 → Settings → 配置 LLM"

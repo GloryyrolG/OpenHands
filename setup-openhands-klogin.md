@@ -2,10 +2,19 @@
 
 > 全程不需要克隆任何代码，只需要 klogin 账号和 Docker。
 
+> **注意**：本文档在各分支共享。具体端口、容器名、ingress 名等值因分支而异，
+> 统一以占位符标注（如 `{APP_PORT}`），实际值见对应分支的 setup 脚本。
+>
+> | 分支 | 脚本 | `{APP_PORT}` | `{CONTAINER}` | `{AGENT_PREFIX}` | `{INGRESS_NAME}` |
+> |------|------|-------------|---------------|-----------------|-----------------|
+> | klogin-deploy | `setup-openhands-klogin.sh` | 3000 | openhands-app | oh-agent-server | openhands |
+> | bridge-mode | `setup-openhands-klogin-bridge.sh` | 3002 | openhands-app-bridge | oh-bridge | openhands-bridge |
+> | tab-display | `setup-openhands-klogin-tab.sh` | 3003 | openhands-app-tab | oh-tab | openhands-tab |
+
 ## 一键部署
 
 ```bash
-bash setup-openhands-klogin.sh
+bash setup-openhands-klogin-{variant}.sh
 ```
 
 脚本会自动完成所有步骤：启动 OpenHands、打全部补丁、建立 SSH 隧道、验证连通性。
@@ -15,7 +24,7 @@ bash setup-openhands-klogin.sh
 ## 架构概述
 
 ```
-浏览器 → klogin ingress (剥离 WS Upgrade) → openhands-app (Python, port 3000)
+浏览器 → klogin ingress (剥离 WS Upgrade) → openhands-app (Python, port {APP_PORT})
                                                   ├── /api/*                  → V0/V1 API
                                                   ├── /agent-server-proxy/*   → 反向代理到 agent-server
                                                   ├── /api/proxy/*            → SSE/WS 事件路由
@@ -62,17 +71,17 @@ bash setup-openhands-klogin.sh
 **问题**：OpenHands 侧边栏的 Code tab（VSCode 编辑器）和 App tab（应用预览）通过 `exposed_urls` 中的 `http://127.0.0.1:{port}` URL 打开 iframe。klogin 用户的浏览器无法直接访问远程机器的 127.0.0.1，导致这些 tab 显示空白或报错。
 
 **方案**：
-- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由，作为 HTTP/WebSocket 反向代理。浏览器请求经 klogin → openhands-app（3000端口）→ 转发到容器内 `http://127.0.0.1:{port}`。
+- **补丁9**：在 `app.py` 注入 `/api/sandbox-port/{port}/{path:path}` 路由，作为 HTTP/WebSocket 反向代理。浏览器请求经 klogin → openhands-app（`{APP_PORT}` 端口）→ 转发到容器内 `http://127.0.0.1:{port}`。
 - **补丁10**：在 `_container_to_sandbox_info()` 中，返回 `SandboxInfo` 前将 VSCODE/WORKER 的 `exposed_urls` 从 `http://127.0.0.1:{port}` 改写为 `/api/sandbox-port/{port}`。AGENT_SERVER URL 保持绝对路径不变（`_container_to_checked_sandbox_info()` health check 需要）。
 
 **验证**：
 ```bash
 # sandbox port proxy 是否存在（需要 sandbox 在运行中）
-curl -s http://localhost:3001/api/sandbox-port/8001/?tkn=<session_api_key>&folder=/workspace/project
+curl -s http://localhost:{TUNNEL_PORT}/api/sandbox-port/8001/?tkn=<session_api_key>&folder=/workspace/project
 # → 应返回 200 OK + VSCode HTML
 
 # exposed_urls 是否正确重写
-curl -s "http://localhost:3001/api/v1/sandboxes?id=<sandbox_id>" | python3 -m json.tool
+curl -s "http://localhost:{TUNNEL_PORT}/api/v1/sandboxes?id=<sandbox_id>" | python3 -m json.tool
 # VSCODE.url 应为 /api/sandbox-port/8001/...（不是 http://127.0.0.1:8001）
 # AGENT_SERVER.url 应为 http://127.0.0.1:8000（保持绝对路径）
 ```
@@ -122,26 +131,18 @@ echo "$EXTERNAL_IP host.docker.internal" | sudo tee -a /etc/hosts
 
 > 不要设置 `OH_SECRET_KEY`，否则 agent-server 认证会 401。
 
+具体命令见对应分支 setup 脚本。关键参数：
+
 ```bash
-sudo docker ps -a --filter name=oh-agent-server -q | xargs -r sudo docker rm -f 2>/dev/null || true
-sudo docker rm -f openhands-app 2>/dev/null || true
+sudo docker ps -a --filter name={AGENT_PREFIX} -q | xargs -r sudo docker rm -f 2>/dev/null || true
+sudo docker rm -f {CONTAINER} 2>/dev/null || true
 
 sudo docker run -d --pull=always \
-  --name openhands-app \
+  --name {CONTAINER} \
   --network host \
-  -e AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server \
-  -e AGENT_SERVER_IMAGE_TAG=1.10.0-python \
-  -e LOG_ALL_EVENTS=true \
-  -e SANDBOX_STARTUP_GRACE_SECONDS=120 \
-  -e SANDBOX_USE_HOST_NETWORK=true \
-  -e AGENT_SERVER_PORT_RANGE_START=12000 \
-  -e AGENT_SERVER_PORT_RANGE_END=13000 \
-  -e 'SANDBOX_CONTAINER_URL_PATTERN=http://127.0.0.1:{port}' \
-  -e OH_WEB_URL='http://127.0.0.1:3000' \
-  -e ENABLE_MCP=false \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/.openhands:/.openhands \
-  docker.openhands.dev/openhands/openhands:1.3
+  ...
+  -e OH_WEB_URL='http://127.0.0.1:{APP_PORT}' \
+  ...
 ```
 
 ### 5. 配置 LLM
@@ -170,13 +171,21 @@ sudo docker run -d --pull=always \
 klogin instances update <instance-id> --static-ip
 
 # 2. 在 klogin 实例上开放防火墙端口
-ssh <instance-id> "sudo ufw allow 3000"
+ssh <instance-id> "sudo ufw allow {APP_PORT}"
 
 # 3. 在本地创建 ingress，禁用 klogin OAuth 层（OpenHands 自带鉴权）
-klogin ingresses create openhands --instance <instance-id> --port 3000 --access-control=false
+klogin ingresses create {INGRESS_NAME} --instance <instance-id> --port {APP_PORT} --access-control=false
 ```
 
 > `--access-control=false`：跳过 klogin 的 AppleConnect OAuth 代理，由 OpenHands 自己负责认证。避免双重 auth 干扰（klogin OAuth 会拦截 cookie/header，导致 OpenHands 登录异常）。
+
+创建后域名固定为：
+
+```
+https://{INGRESS_NAME}.svc.<instance-id>.klogin-user.mlplatform.apple.com
+```
+
+需要 AppleConnect 认证，浏览器会自动弹出。
 
 ### Agent 启动的 App 分享给同事（Streamlit / Gradio 等）
 
@@ -206,19 +215,11 @@ done
 
 > **注意**：UFW 必须提前开放对应端口，否则 klogin health probe 探活失败，ingress 显示 `READY=false`，访问返回 503。
 
-创建后域名固定为：
-
-```
-https://openhands.svc.<instance-id>.klogin-user.mlplatform.apple.com
-```
-
-需要 AppleConnect 认证，浏览器会自动弹出。
-
 ### SSH 本地隧道
 
 ```bash
-ssh -f -N -L 3001:127.0.0.1:3000 <instance-id>
-# 然后访问 http://localhost:3001
+ssh -f -N -L {TUNNEL_PORT}:127.0.0.1:{APP_PORT} <instance-id>
+# 然后访问 http://localhost:{TUNNEL_PORT}
 ```
 
 ---
@@ -227,37 +228,37 @@ ssh -f -N -L 3001:127.0.0.1:3000 <instance-id>
 
 ### 会话显示 Disconnected
 
-未打前端补丁，或容器 `docker rm -f` 重建后补丁丢失。重新运行 `setup-openhands-klogin.sh` 即可。
+未打前端补丁，或容器 `docker rm -f` 重建后补丁丢失。重新运行 setup 脚本即可。
 
 ### 401 Unauthorized
 
 ```bash
 # 清理旧 agent-server 容器
-sudo docker ps -a --filter name=oh-agent-server -q | xargs -r sudo docker rm -f
-sudo docker rm -f openhands-app
-# 用上面正确命令重新启动（不加 OH_SECRET_KEY）
+sudo docker ps -a --filter name={AGENT_PREFIX} -q | xargs -r sudo docker rm -f
+sudo docker rm -f {CONTAINER}
+# 重新运行 setup 脚本（不加 OH_SECRET_KEY）
 ```
 
 ### V1 会话消息无响应
 
 HTTP POST 到 agent-server 不唤醒 Python agent asyncio 队列。补丁2/6/7 通过 WebSocket 转发解决此问题。如果仍有问题，检查 agent-server 是否在运行：
 ```bash
-sudo docker ps --filter name=oh-agent-server
+sudo docker ps --filter name={AGENT_PREFIX}
 ```
 
 ### 查看日志
 
 ```bash
-sudo docker logs openhands-app --tail 50
+sudo docker logs {CONTAINER} --tail 50
 # agent-server 日志
-AGENT=$(sudo docker ps --filter name=oh-agent-server -q | head -1)
+AGENT=$(sudo docker ps --filter name={AGENT_PREFIX} -q | head -1)
 sudo docker logs $AGENT --tail 50
 ```
 
 ### 验证 per-conversation 目录隔离
 
 ```bash
-AGENT=$(sudo docker ps --filter name=oh-agent-server -q | head -1)
+AGENT=$(sudo docker ps --filter name={AGENT_PREFIX} -q | head -1)
 sudo docker exec $AGENT ls /workspace/project/
 # 应看到多个 UUID 子目录，每个对应一个会话
 ```
