@@ -2957,16 +2957,6 @@ for JS_ASSET in markdown-renderer-Ci-ahARR.js parse-pr-url-BOXiVwNz.js; do
         echo "重启后重新注入 polling 补丁: ${JS_ASSET}"
     }
 done
-sudo docker exec openhands-app-tab python3 /tmp/patch_v1svc.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_sre.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_api_proxy_events.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_per_conv_workspace.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_port_proxy.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_sandbox_exposed_urls.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_rate_limiter.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_browser_store_expose.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_port_scan_html.py
-sudo docker exec openhands-app-tab python3 /tmp/patch_tabs_fixes.py
 # 重新注入 index.html FakeWS（/api/proxy/events 路径，klogin 可转发，含 browser tab fix）
 sudo docker cp openhands-app-tab:/app/frontend/build/index.html /tmp/oh-index.html 2>/dev/null
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
