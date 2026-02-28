@@ -2436,7 +2436,7 @@ def _docker_exec_http(container_id: str, port: int, path: str,
 
 '''
 
-if '[OH-TAB-PY3]' in proxy_src:
+if '[OH-TAB-PY3]' in proxy_src or '[OH-TAB-PY3-V2]' in proxy_src:
     print('agent_server_proxy.py: _docker_exec_http already python3 version ✓')
 elif '_docker_exec_http' not in proxy_src:
     proxy_src = proxy_src.replace('def _get_oh_tab_container_for_port', NEW_EXEC_FUNC + 'def _get_oh_tab_container_for_port', 1)
@@ -2641,18 +2641,43 @@ proxy_path = '/app/openhands/server/routes/agent_server_proxy.py'
 with open(proxy_path) as f:
     proxy_src = f.read()
 
-if '[OH-TAB-PY3]' in proxy_src:
-    print('agent_server_proxy.py: _docker_exec_http already python3 version ✓')
+if '[OH-TAB-PY3-V2]' in proxy_src:
+    print('agent_server_proxy.py: _docker_exec_http already V2 (SIGCONT) ✓')
 elif 'def _docker_exec_http(' in proxy_src:
     import base64 as _b64_fix9
-    # Build the new python3-based _docker_exec_http
+    # Build V2: python3-based + SIGCONT recovery for SIGSTOP\'d apps
     NEW_EXEC_PY3 = '''def _docker_exec_http(container_id: str, port: int, path: str,
                        method: str = "GET", body_bytes: bytes = b"",
                        req_headers: dict = None) -> tuple:
-    """[OH-TAB-PY3] Proxy HTTP request via docker exec python3 (for 127.0.0.1-bound apps).
-    Uses python3 http.client — no curl dependency. Forwards Cookie/Content-Type/body.
+    """[OH-TAB-PY3-V2] Proxy HTTP request via docker exec python3 (for 127.0.0.1-bound apps).
+    Uses python3 http.client — no curl. Handles SIGSTOP\'d apps: SIGCONTs all stopped
+    processes in the container then retries. /proc/pid/status is world-readable for root.
     Returns (status_code, headers_dict, body_bytes, content_type_str)."""
-    import json as _j, base64 as _b64
+    import json as _j, base64 as _b64, time as _time
+
+    def _exec_cmd(cmd):
+        eb = _j.dumps({"Cmd": cmd, "AttachStdout": True, "AttachStderr": False, "User": "root"}).encode()
+        c1 = _UnixHTTPConnection("/var/run/docker.sock")
+        c1.request("POST", f"/containers/{container_id}/exec", body=eb,
+                   headers={"Content-Type": "application/json", "Content-Length": str(len(eb))})
+        info = _j.loads(c1.getresponse().read())
+        eid = info.get("Id")
+        if not eid:
+            return b""
+        sb = b\'{"Detach":false,"Tty":false}\'
+        c2 = _UnixHTTPConnection("/var/run/docker.sock")
+        c2.request("POST", f"/exec/{eid}/start", body=sb,
+                   headers={"Content-Type": "application/json", "Content-Length": str(len(sb))})
+        raw = c2.getresponse().read()
+        out = b""
+        pos = 0
+        while pos + 8 <= len(raw):
+            stype = raw[pos]; sz = int.from_bytes(raw[pos+4:pos+8], "big")
+            if sz == 0: pos += 8; continue
+            if stype == 1: out += raw[pos+8:pos+8+sz]
+            pos += 8 + sz
+        return out
+
     _cookie = ""
     _ct_hdr = ""
     if req_headers:
@@ -2660,51 +2685,45 @@ elif 'def _docker_exec_http(' in proxy_src:
         _ct_hdr = req_headers.get("content-type") or req_headers.get("Content-Type", "")
     _body_b64 = _b64.b64encode(body_bytes).decode() if body_bytes else ""
     _req_path = "/" + path if path else "/"
-    _py = (
-        "import http.client as _c,sys,base64 as _b;"
-        "_h={'Connection':'close'};"
-        + ("_h['Cookie']=" + repr(_cookie) + ";" if _cookie else "")
-        + ("_h['Content-Type']=" + repr(_ct_hdr) + ";" if _ct_hdr else "")
-        + "_bd=_b.b64decode(" + repr(_body_b64) + ") if " + repr(_body_b64) + " else b'';"
-        + "conn=_c.HTTPConnection('127.0.0.1'," + str(port) + ",timeout=10);"
-        + "conn.request(" + repr(method) + "," + repr(_req_path) + ",_bd,_h);"
-        + "r=conn.getresponse();"
-        + "sys.stdout.buffer.write(b'HTTP/1.1 '+str(r.status).encode()+b' OK\\r\\n');"
-        + "[(sys.stdout.buffer.write((k+': '+v+'\\r\\n').encode())) for k,v in r.getheaders()];"
-        + "sys.stdout.buffer.write(b'\\r\\n');"
-        + "sys.stdout.buffer.write(r.read())"
-    )
-    cmd = ["python3", "-c", _py]
-    exec_body = _j.dumps({
-        "Cmd": cmd, "AttachStdout": True, "AttachStderr": False, "User": "root"
-    }).encode()
-    conn = _UnixHTTPConnection("/var/run/docker.sock")
-    conn.request("POST", f"/containers/{container_id}/exec", body=exec_body,
-                 headers={"Content-Type": "application/json",
-                          "Content-Length": str(len(exec_body))})
-    resp = conn.getresponse()
-    exec_info = _j.loads(resp.read())
-    exec_id = exec_info.get("Id")
-    if not exec_id:
-        raise Exception("exec create failed")
-    start_body = b\'{"Detach":false,"Tty":false}\'
-    conn2 = _UnixHTTPConnection("/var/run/docker.sock")
-    conn2.request("POST", f"/exec/{exec_id}/start", body=start_body,
-                  headers={"Content-Type": "application/json",
-                           "Content-Length": str(len(start_body))})
-    resp2 = conn2.getresponse()
-    raw = resp2.read()
-    stdout = b""
-    pos = 0
-    while pos + 8 <= len(raw):
-        stream_type = raw[pos]
-        size = int.from_bytes(raw[pos+4:pos+8], "big")
-        if size == 0:
-            pos += 8
-            continue
-        if stream_type == 1:  # stdout only
-            stdout += raw[pos+8:pos+8+size]
-        pos += 8 + size
+
+    def _http_py(timeout_s):
+        return (
+            "import http.client as _c,sys,base64 as _b;"
+            "_h={\'Connection\':\'close\'};"
+            + ("_h[\'Cookie\']=" + repr(_cookie) + ";" if _cookie else "")
+            + ("_h[\'Content-Type\']=" + repr(_ct_hdr) + ";" if _ct_hdr else "")
+            + "_bd=_b.b64decode(" + repr(_body_b64) + ") if " + repr(_body_b64) + " else b\'\';"
+            + "conn=_c.HTTPConnection(\'127.0.0.1\'," + str(port) + ",timeout=" + str(timeout_s) + ");"
+            + "conn.request(" + repr(method) + "," + repr(_req_path) + ",_bd,_h);"
+            + "r=conn.getresponse();"
+            + "sys.stdout.buffer.write(b\'HTTP/1.1 \'+str(r.status).encode()+b\' OK\\r\\n\');"
+            + "[(sys.stdout.buffer.write((k+\': \'+v+\'\\r\\n\').encode())) for k,v in r.getheaders()];"
+            + "sys.stdout.buffer.write(b\'\\r\\n\');"
+            + "sys.stdout.buffer.write(r.read())"
+        )
+
+    # First attempt: short timeout detects SIGSTOP\'d apps (full accept backlog → connect times out)
+    stdout = _exec_cmd(["python3", "-c", _http_py(3)])
+    if not stdout:
+        # SIGCONT all stopped processes in the container.
+        # Note: /proc/pid/fd readlinks are restricted by ptrace scope even for root,
+        # but /proc/pid/status is world-readable and os.kill() works for root.
+        _sc = (
+            "import os,signal\n"
+            "try:\n"
+            "  for pid in os.listdir(\'/proc\'):\n"
+            "    if not pid.isdigit(): continue\n"
+            "    try:\n"
+            "      st=open(f\'/proc/{pid}/status\').read()\n"
+            "      if \'T (stopped)\' in st:\n"
+            "        os.kill(int(pid),signal.SIGCONT)\n"
+            "    except: pass\n"
+            "except: pass\n"
+        )
+        _enc = _b64.b64encode(_sc.encode()).decode()
+        _exec_cmd(["python3", "-c", "import base64; exec(base64.b64decode(\'" + _enc + "\').decode())"])
+        _time.sleep(1.0)
+        stdout = _exec_cmd(["python3", "-c", _http_py(12)])
     if b"\\r\\n\\r\\n" not in stdout:
         raise Exception(f"no HTTP separator ({len(stdout)} bytes stdout)")
     headers_raw, body = stdout.split(b"\\r\\n\\r\\n", 1)
@@ -2727,7 +2746,7 @@ elif 'def _docker_exec_http(' in proxy_src:
         proxy_src = proxy_src[:idx] + NEW_EXEC_PY3 + proxy_src[end_idx+1:]
         with open(proxy_path, 'w') as f:
             f.write(proxy_src)
-        print('agent_server_proxy.py: _docker_exec_http upgraded to python3 ✓')
+        print('agent_server_proxy.py: _docker_exec_http upgraded to V2 (SIGCONT) ✓')
     else:
         print('WARNING: could not find _docker_exec_http boundary in proxy file')
 else:
