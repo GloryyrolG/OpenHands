@@ -2702,11 +2702,15 @@ elif 'def _docker_exec_http(' in proxy_src:
             + "sys.stdout.buffer.write(r.read())"
         )
 
-    # First attempt: short timeout detects SIGSTOP\'d apps (full accept backlog → connect times out)
+    # First attempt: short timeout detects SIGSTOP\'d apps.
+    # SIGSTOP\'d: kernel accepts TCP but process never calls recv() → getresponse() times out (~3s).
+    # Not-running: connect() refuses immediately → exec completes in <0.5s.
+    _t0 = _time.time()
     stdout = _exec_cmd(["python3", "-c", _http_py(3)])
-    if not stdout:
-        # SIGCONT all stopped processes in the container.
-        # Note: /proc/pid/fd readlinks are restricted by ptrace scope even for root,
+    _elapsed = _time.time() - _t0
+    if not stdout and _elapsed > 2.0:
+        # Took ~3s → process exists but SIGSTOP\'d. SIGCONT all stopped processes.
+        # Note: /proc/pid/fd readlinks restricted by ptrace scope even for root,
         # but /proc/pid/status is world-readable and os.kill() works for root.
         _sc = (
             "import os,signal\n"
