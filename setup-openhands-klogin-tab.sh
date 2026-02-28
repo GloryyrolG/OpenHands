@@ -1735,15 +1735,39 @@ async def sandbox_port_proxy_root(port: int, request: Request):
 async def sandbox_port_ws_proxy(port: int, path: str, websocket: _FastAPIWebSocket):
     """WebSocket proxy for sandbox ports (VSCode needs WS for language server)."""
     import websockets as _ws
-    await websocket.accept()
+    # [oh-tab-scan-ws-v2] Forward subprotocols (Streamlit uses "streamlit")
+    _sw_subproto_hdr = websocket.headers.get("sec-websocket-protocol", "")
+    _sw_subprotos = [s.strip() for s in _sw_subproto_hdr.split(",") if s.strip()]
+    await websocket.accept(subprotocol=_sw_subprotos[0] if _sw_subprotos else None)
     qs = str(websocket.query_params)
-    _cip = _get_oh_tab_ip()
-    _proxy_host = (_cip if (_cip and port < 20000) else "127.0.0.1")
-    ws_url = f"ws://{_proxy_host}:{port}/{path}"
-    if qs:
-        ws_url += f"?{qs}"
+    # [oh-tab-scan-ws] scan/{sp_port}/{path} -> container bridge IP (e.g. Streamlit WS)
+    if path.startswith("scan/"):
+        _sw_rest = path[5:]
+        _sw_parts = _sw_rest.split("/", 1)
+        _sw_sp_port = int(_sw_parts[0]) if _sw_parts[0].isdigit() else 0
+        _sw_sp_path = _sw_parts[1] if len(_sw_parts) > 1 else ""
+        if not _sw_sp_port:
+            await websocket.close(1003); return
+        from openhands.server.routes.agent_server_proxy import _get_oh_tab_container_for_port as _gcfp_ws
+        _cdata_ws = _gcfp_ws(port)
+        _ns_ws = _cdata_ws.get("NetworkSettings", {})
+        _cip_ws = (_ns_ws.get("IPAddress", "") or
+            next((v.get("IPAddress","") for v in _ns_ws.get("Networks",{}).values()
+                  if v.get("IPAddress","")), ""))
+        if not _cip_ws:
+            await websocket.close(1011); return
+        ws_url = f"ws://{_cip_ws}:{_sw_sp_port}/{_sw_sp_path}"
+        if qs: ws_url += f"?{qs}"
+    else:
+        _cip = _get_oh_tab_ip()
+        _proxy_host = (_cip if (_cip and port < 20000) else "127.0.0.1")
+        ws_url = f"ws://{_proxy_host}:{port}/{path}"
+        if qs:
+            ws_url += f"?{qs}"
     try:
-        async with _ws.connect(ws_url) as target_ws:
+        _sw_connect_kwargs = {}
+        if _sw_subprotos: _sw_connect_kwargs["subprotocols"] = _sw_subprotos
+        async with _ws.connect(ws_url, **_sw_connect_kwargs) as target_ws:
             import asyncio
             async def client_to_target():
                 try:
