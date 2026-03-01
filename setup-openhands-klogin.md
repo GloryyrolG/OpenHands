@@ -115,8 +115,7 @@ klogin instances apps sub <instance-id> -a docker
 
 SSH 进入实例：
 ```bash
-klogin instances ssh <instance-id>
-# 或 raw SSH（等效）：ssh <instance-id>
+ssh <instance-id>
 ```
 
 ```bash
@@ -215,12 +214,7 @@ done
 ### SSH 本地隧道
 
 ```bash
-# 推荐：klogin 原生隧道（自动处理代理/证书）
-klogin instances tunnel -l {TUNNEL_PORT}:{APP_PORT} -b <instance-id>
-
-# 或 raw SSH（等效）
 ssh -f -N -L {TUNNEL_PORT}:127.0.0.1:{APP_PORT} <instance-id>
-
 # 然后访问 http://localhost:{TUNNEL_PORT}
 ```
 

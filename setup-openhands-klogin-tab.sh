@@ -243,10 +243,9 @@ klogin ingresses create openhands-tab --instance "$INSTANCE_ID" --port 3003 --ac
 # 5. 建立本地 SSH 隧道并验证
 echo ""
 echo ">>> 建立本地隧道并验证..."
-pkill -f "ssh.*-L 3004.*$INSTANCE_ID" 2>/dev/null || true
-pkill -f "klogin.*tunnel.*3004" 2>/dev/null || true
+pkill -f "ssh.*-L 3001.*$INSTANCE_ID" 2>/dev/null || true
 sleep 1
-klogin instances tunnel -l 3004:3003 -b "$INSTANCE_ID"
+ssh -f -N -L 3004:127.0.0.1:3003 "$INSTANCE_ID"
 sleep 2
 
 echo "测试 API 连通性..."
