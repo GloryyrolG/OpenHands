@@ -35,8 +35,10 @@ class ServerConfig(ServerConfigInterface):
         'openhands.server.conversation_manager.standalone_conversation_manager.StandaloneConversationManager',
     )
     monitoring_listener_class: str = 'openhands.server.monitoring.MonitoringListener'
-    user_auth_class: str = (
-        'openhands.server.user_auth.default_user_auth.DefaultUserAuth'
+    # Multi-user mode: use JWT auth for user isolation
+    user_auth_class: str = os.environ.get(
+        'USER_AUTH_CLASS',
+        'openhands.server.user_auth.jwt_user_auth.JWTUserAuth'
     )
     enable_v1: bool = os.getenv('ENABLE_V1') != '0'
 
