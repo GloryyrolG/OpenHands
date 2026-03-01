@@ -179,6 +179,55 @@ sudo docker cp openhands-app-tab:/app/frontend/build/index.html /tmp/oh-index.ht
 sudo chmod 666 /tmp/oh-index.html 2>/dev/null
 python3 /tmp/patch_fakews.py
 sudo docker cp /tmp/oh-index.html openhands-app-tab:/app/frontend/build/index.html 2>/dev/null || true
+
+# ─── 恢复历史会话（重启后所有会话变 STOPPED，自动 stream-start 恢复）───
+echo ""
+echo ">>> 恢复历史会话..."
+python3 << 'PYEOF'
+import urllib.request, urllib.error, json, time, sys
+
+BASE = 'http://127.0.0.1:3003'
+
+def api(path, data=None):
+    url = BASE + path
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body,
+          headers={'Content-Type': 'application/json'} if body else {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {'error': e.code, 'body': e.read().decode()[:200]}
+    except Exception as e:
+        return {'error': str(e)}
+
+# 取所有会话，找 STOPPED 的
+convs = api('/api/conversations?limit=100')
+if not isinstance(convs, list):
+    convs = convs.get('results', convs.get('conversations', []))
+
+stopped = [c for c in convs
+           if c.get('status') == 'STOPPED'
+           and c.get('conversation_version') == 'V1']
+
+print(f'共 {len(convs)} 个会话，{len(stopped)} 个 STOPPED 需恢复')
+
+ok = fail = 0
+for c in stopped:
+    cid = c.get('conversation_id', c.get('id', ''))
+    r = api('/api/v1/app-conversations/stream-start',
+            {'conversation_id': cid})
+    if isinstance(r, dict) and 'error' in r:
+        print(f'  ✗ {cid[:16]}... 恢复失败: {r}')
+        fail += 1
+    else:
+        first = r[0] if isinstance(r, list) and r else r
+        print(f'  ✓ {cid[:16]}... 恢复中（{first.get("status","?") if isinstance(first,dict) else "?"}）')
+        ok += 1
+    time.sleep(0.5)   # 避免同时启动太多容器
+
+print(f'恢复完成：{ok} 成功，{fail} 失败')
+PYEOF
 REMOTE
 
 # 4. 配置 klogin ingress（域名访问，只需运行一次）
