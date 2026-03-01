@@ -3,9 +3,11 @@ APP_PATH = '/app/openhands/server/app.py'
 with open(APP_PATH) as f:
     src = f.read()
 
-if '[oh-tab-port-scan]' in src:
+if '[oh-tab-port-scan]' in src and '_PORT_SCAN_HTML' in src:
     print('Auto-scan HTML already in sandbox_port_proxy ✓')
     exit(0)
+if '[oh-tab-port-scan]' in src and '_PORT_SCAN_HTML' not in src:
+    print('WARNING: [oh-tab-port-scan] present but _PORT_SCAN_HTML missing — re-injecting constant')
 
 SCAN_HTML = (
     '<!DOCTYPE html><html><head><title>App Scanner</title>'
