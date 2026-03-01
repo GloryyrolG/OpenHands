@@ -16,7 +16,7 @@ _DB_PATH = '/root/.openhands/openhands.db'
 
 # Per-conversation URL cache: conversation_id -> (agent_server_url, timestamp)
 _url_cache: dict = {}
-_URL_CACHE_TTL = 3600  # 1 hour; URLs don't change once task is READY
+_URL_CACHE_TTL = 300  # 5 min; short enough to recover after stream-start replaces container
 
 
 class _UnixHTTPConnection(_http_client.HTTPConnection):
@@ -112,7 +112,7 @@ def _get_oh_tab_ip() -> str:
 
 
 _key_cache: dict = {}  # cid -> (key, timestamp)
-_KEY_CACHE_TTL = 3600  # 1 hour; keys don't change during container lifetime
+_KEY_CACHE_TTL = 300  # 5 min; matches URL cache so stale key is evicted together
 def _get_tab_agent_key(conversation_id: str) -> str:
     """Get session_api_key for this conversation's oh-tab- container via Docker API."""
     import time as _t

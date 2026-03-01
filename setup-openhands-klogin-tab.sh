@@ -201,30 +201,54 @@ def api(path, data=None):
     except Exception as e:
         return {'error': str(e)}
 
-# 取所有会话，找 STOPPED 的
+import subprocess as _sp
+
 convs = api('/api/conversations?limit=100')
 if not isinstance(convs, list):
     convs = convs.get('results', convs.get('conversations', []))
 
-stopped = [c for c in convs
-           if c.get('status') == 'STOPPED'
-           and c.get('conversation_version') == 'V1']
+v1 = [c for c in convs if c.get('conversation_version') == 'V1']
+stopped = [c for c in v1 if c.get('status') == 'STOPPED']
 
-print(f'共 {len(convs)} 个会话，{len(stopped)} 个 STOPPED 需恢复')
+# 先清理 PAUSED 容器（stream-start 遇 paused 容器会 409 冲突）
+for c in v1:
+    cid = c.get('conversation_id', c.get('id', ''))
+    cid_nodash = cid.replace('-', '')
+    name = f'oh-tab-{cid_nodash}'
+    out = _sp.run(['sudo', 'docker', 'inspect', '--format', '{{.State.Status}}', name],
+                  capture_output=True, text=True).stdout.strip()
+    if out == 'paused':
+        ret = _sp.run(['sudo', 'docker', 'rm', '-f', name], capture_output=True)
+        if ret.returncode == 0:
+            print(f'  已清理 paused 容器: {name}')
+            if c not in stopped:
+                stopped.append(c)
+        else:
+            print(f'  ⚠ paused 容器清理失败，跳过: {name}')
+
+print(f'共 {len(convs)} 个会话，{len(stopped)} 个需恢复')
 
 ok = fail = 0
 for c in stopped:
     cid = c.get('conversation_id', c.get('id', ''))
-    r = api('/api/v1/app-conversations/stream-start',
-            {'conversation_id': cid})
+    r = api('/api/v1/app-conversations/stream-start', {'conversation_id': cid})
+    # stream-start 返回 list of streaming events；错误时 list 末尾有 status=ERROR
     if isinstance(r, dict) and 'error' in r:
-        print(f'  ✗ {cid[:16]}... 恢复失败: {r}')
+        print(f'  ✗ {cid[:16]}... 失败(HTTP): {r.get("error")}')
         fail += 1
+    elif isinstance(r, list):
+        last = r[-1] if r else {}
+        if isinstance(last, dict) and last.get('status') == 'ERROR':
+            print(f'  ✗ {cid[:16]}... 失败: {last.get("detail","?")[:80]}')
+            fail += 1
+        else:
+            first = r[0] if r else {}
+            print(f'  ✓ {cid[:16]}... 恢复中（{first.get("status","?") if isinstance(first,dict) else "?"}）')
+            ok += 1
     else:
-        first = r[0] if isinstance(r, list) and r else r
-        print(f'  ✓ {cid[:16]}... 恢复中（{first.get("status","?") if isinstance(first,dict) else "?"}）')
-        ok += 1
-    time.sleep(0.5)   # 避免同时启动太多容器
+        print(f'  ? {cid[:16]}... 未知响应: {str(r)[:60]}')
+        fail += 1
+    time.sleep(0.5)
 
 print(f'恢复完成：{ok} 成功，{fail} 失败')
 PYEOF

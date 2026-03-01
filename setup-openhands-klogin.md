@@ -53,7 +53,7 @@ bash setup-openhands-klogin-{variant}.sh
 | `patch_workspace.py` | `live_status_app_conversation_service.py` | per-conversation workspace 子目录隔离（`/workspace/project/{id}/`）；git init 在 workspace root |
 | `patch_frontend_js.py` | JS assets + `index.html` + `middleware.py` | cache-control no-cache；socket.io polling；v1-svc 路由；FakeWS 全局拦截；cache busting（z-suffix rename）；browser store expose |
 | `patch_code_app_tabs.py` | `app.py` | `/api/sandbox-port/{port}/*` HTTP/WS 反代（VSCode/App tab）；App tab 自动端口扫描（scan HTML、探针、目录列表拒绝）；scan WebSocket 代理（subprotocol 转发）；VSCode tab URL 修复 |
-| `agent_server_proxy.py` | `app.py`（模块） | agent-server 反向代理：per-conv URL 查 SQLite；per-session key 注入；TTL cache（60s container，1h key/url） |
+| `agent_server_proxy.py` | `app.py`（模块） | agent-server 反向代理：per-conv URL 查 SQLite；per-session key 注入；TTL cache（60s container，5min key/url） |
 | `patch_fakews.py` | 宿主机 JS（单独运行） | FakeWS polyfill（绕过 klogin WebSocket 限制，将 WS 降级为 socket.io polling） |
 
 ### 补丁8 详细说明：Per-Conversation 工作目录隔离
@@ -266,6 +266,30 @@ sudo docker exec $AGENT ls /workspace/project/
 **原因**：容器 `docker restart` 后 `_PORT_SCAN_HTML` Python 全局变量丢失（patch 12a 注入的常量依赖 app.py 的 writable layer，重启时 Python 进程重载了旧 bytecode 或 patch 未正确持久化）。
 
 **修复**：重新运行 setup 脚本（`bash setup-openhands-klogin-tab.sh`），或单独上传并执行 `patches/patch_code_app_tabs.py`。
+
+### 历史会话恢复后仍显示 "Initializing agent..."
+
+stream-start 成功（API 返回 WORKING）但浏览器卡在 "Initializing agent..." 约 90 秒。
+
+**原因**：`agent_server_proxy.py` 的 URL 缓存 TTL 过期前（5 分钟）仍指向旧容器端口，SSE 连接反复连到 DOWN 端口，每次等 3 秒重试，30 次后才放弃。已在 `_URL_CACHE_TTL = 300` 修复（原为 3600）。
+
+**出现此现象（旧部署）的临时修复**：
+```bash
+sudo docker restart openhands-app-tab
+bash setup-openhands-klogin-tab.sh  # 重打 patches + auto-resume
+```
+
+### auto-resume 409 Conflict（paused 容器占用同名）
+
+stream-start 失败，日志显示 `409 ... container name "/oh-tab-{id}" is already in use`。
+
+**原因**：oh-tab-* 容器处于 **paused** 状态（非 stopped/removed），stream-start 尝试新建同名容器冲突。setup 脚本的 auto-resume 已修复，会在 stream-start 前自动 `docker rm -f` paused 容器。
+
+**手动修复**：
+```bash
+sudo docker rm -f oh-tab-<conversation_id_without_dashes>
+# 然后在页面刷新，或 setup 脚本会自动 stream-start
+```
 
 ### MCP 工具不可用（bridge mode 会话）
 
