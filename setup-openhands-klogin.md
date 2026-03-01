@@ -46,24 +46,15 @@ bash setup-openhands-klogin-{variant}.sh
 
 > **Patch sentinel 最佳实践**：每个 patch 的"already applied"检查必须用该 patch 注入的**唯一 sentinel 字符串**，而不是可能在文件别处出现的通用字符串。False-positive 会导致 patch 静默跳过但实际未生效（例：`patch_bridge_fixes.py` Fix 3 原来用 `'host.docker.internal' in src` 会命中第 1515 行无关代码，需改为注入的注释行作 sentinel）。
 
-| # | 补丁 | 修改文件 | 解决问题 |
-|---|------|----------|----------|
-| 1 | per-session sandbox 隔离 | `docker_sandbox_service.py` | 每会话独立 sandbox 容器，消除多 sandbox 争端口 8000 → 401 |
-| 1.5 | bridge 模式网络修复 | 同上 | extra_hosts 条件修复；webhook port 从 OH_WEB_URL 读；MCP URL 换 host.docker.internal |
-| 2 | agent-server 反向代理 | `agent_server_proxy.py` + `app.py` | 浏览器无法直接访问 127.0.0.1:8000；per-conv URL 查 SQLite；per-session key 注入 |
-| 3–7 | 前端 JS + SSE 路由 | JS assets + `app.py` + `index.html` | socket.io polling；v1-svc 路由；SSE 事件流；FakeWS 全局拦截；cache busting（z-suffix） |
-| 2b | rate limiter 修复 | `middleware.py` | klogin 共享 IP + SSE 重连风暴导致全局 429；SSE 排除限流 |
-| 8 | per-conversation workspace | `live_status_app_conversation_service.py` | 每会话独立 `/workspace/project/{id}/` 子目录；git init 在 workspace root |
-| 9 | sandbox port proxy (HTTP) | `app.py` | `/api/sandbox-port/{port}/*` 反代 VSCode/App tab；Location/HTML rewrite；strip CSP |
-| 9b | 容器 bridge IP 路由 | 同上 | port<20000 → 容器 bridge IP（内部端口）；port≥20000 → 127.0.0.1（Docker NAT） |
-| 10 | exposed_urls 重写 | `docker_sandbox_service.py` | VSCODE/WORKER URL 改为 `/api/sandbox-port/{port}`；AGENT_SERVER 保持绝对 URL |
-| 11 | vscode-tab URL fix + z-suffix | JS assets | VSCode URL parse 修复；z-suffix rename 绕过 immutable 30d 浏览器缓存 |
-| 12a | App tab 自动端口扫描 | `app.py` | 访问 App tab 无 app 时返回扫描页；自动探测并跳转到 AI 启动的 app 端口 |
-| 12b | scan proxy 完整支持 | `app.py` | docker exec fallback（loopback app）；HTML URL 重写；Cookie 转发；stateful app 支持 |
-| 12c | 目录列表 → scan HTML | `app.py` | 直接访问 workspace 文件服务器时返回扫描页而非目录列表 |
-| 12d | scan 探针拒绝目录列表 | `app.py` | scan probe 遇目录列表返回 502，跳过文件服务器端口继续扫描 |
-| 13 | scan WebSocket 代理 | `app.py` | 转发 scan 路径的 WS（Streamlit 等需要）；正确传递 subprotocol（`streamlit`） |
-| QA | proxy 代码质量改进 | `agent_server_proxy.py` + `app.py` | `lru_cache` → 60s TTL cache（stale container 后自动刷新）；`_key_cache`/`_url_cache` 加 1h TTL；Referer 正则支持 `task-` 前缀；`get_running_loop()` 替换废弃 `get_event_loop()`；PROXY_ROUTES 自包含 `_get_oh_tab_ip` import（消除 patch 顺序依赖）|
+| 文件 | 修改目标 | 功能 |
+|------|----------|------|
+| `patch_sandbox_infra.py` | `docker_sandbox_service.py` | per-session sandbox 隔离（每会话独立 oh-tab-* 容器）；bridge 模式网络修复（extra_hosts、webhook port、MCP URL）；exposed_urls 重写（VSCODE/WORKER → `/api/sandbox-port/{port}`） |
+| `patch_agent_comms.py` | `app.py` + `middleware.py` | `/api/proxy/events/{id}` SSE 路由 + session key 注入（修复 agent-server 403）；rate limiter 修复（SSE 排除限流）；容器 bridge IP 路由（port<20000 → 内部 IP，port≥20000 → 127.0.0.1） |
+| `patch_workspace.py` | `live_status_app_conversation_service.py` | per-conversation workspace 子目录隔离（`/workspace/project/{id}/`）；git init 在 workspace root |
+| `patch_frontend_js.py` | JS assets + `index.html` + `middleware.py` | cache-control no-cache；socket.io polling；v1-svc 路由；FakeWS 全局拦截；cache busting（z-suffix rename）；browser store expose |
+| `patch_code_app_tabs.py` | `app.py` | `/api/sandbox-port/{port}/*` HTTP/WS 反代（VSCode/App tab）；App tab 自动端口扫描（scan HTML、探针、目录列表拒绝）；scan WebSocket 代理（subprotocol 转发）；VSCode tab URL 修复 |
+| `agent_server_proxy.py` | `app.py`（模块） | agent-server 反向代理：per-conv URL 查 SQLite；per-session key 注入；TTL cache（60s container，1h key/url） |
+| `patch_fakews.py` | 宿主机 JS（单独运行） | FakeWS polyfill（绕过 klogin WebSocket 限制，将 WS 降级为 socket.io polling） |
 
 ### 补丁8 详细说明：Per-Conversation 工作目录隔离
 
@@ -274,7 +265,7 @@ sudo docker exec $AGENT ls /workspace/project/
 
 **原因**：容器 `docker restart` 后 `_PORT_SCAN_HTML` Python 全局变量丢失（patch 12a 注入的常量依赖 app.py 的 writable layer，重启时 Python 进程重载了旧 bytecode 或 patch 未正确持久化）。
 
-**修复**：重新运行 setup 脚本（`bash setup-openhands-klogin-tab.sh`），或单独上传并执行 `patches/patch_port_scan_html.py`。
+**修复**：重新运行 setup 脚本（`bash setup-openhands-klogin-tab.sh`），或单独上传并执行 `patches/patch_code_app_tabs.py`。
 
 ### MCP 工具不可用（bridge mode 会话）
 
