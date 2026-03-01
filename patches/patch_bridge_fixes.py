@@ -79,7 +79,7 @@ LIVE_PATH = '/app/openhands/app_server/app_conversation/live_status_app_conversa
 with open(LIVE_PATH) as f:
     src3 = f.read()
 
-if 'host.docker.internal' in src3 and 'mcp_url' in src3:
+if '[OH-TAB] bridge mode: replace 127.0.0.1' in src3:
     print('MCP URL fix already present ✓')
 else:
     old_mcp = "        mcp_url = f'{self.web_url}/mcp/mcp'"
