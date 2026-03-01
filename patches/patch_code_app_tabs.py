@@ -85,7 +85,7 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
                         "&quot;serverBasePath&quot;:&quot;/&quot;",
                         "&quot;serverBasePath&quot;:&quot;" + proxy_base + "/&quot;")
                     html = _re.sub(
-                        r"(new URL\(')(/stable-[^']+)(')",
+                        r"(new URL[(]')(/stable-[^']+)(')",
                         lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3), html)
                     html = _re.sub(
                         r"&quot;remoteAuthority&quot;:&quot;[^&]*&quot;",
