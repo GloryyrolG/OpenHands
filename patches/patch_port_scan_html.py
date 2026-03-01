@@ -7,7 +7,7 @@ if '[oh-tab-port-scan]' in src and '_PORT_SCAN_HTML' in src:
     print('Auto-scan HTML already in sandbox_port_proxy ✓')
     exit(0)
 if '[oh-tab-port-scan]' in src and '_PORT_SCAN_HTML' not in src:
-    print('WARNING: [oh-tab-port-scan] present but _PORT_SCAN_HTML missing — re-injecting constant')
+    print('WARNING: [oh-tab-port-scan] present but _PORT_SCAN_HTML missing — re-injecting constant and continuing')
 
 SCAN_HTML = (
     '<!DOCTYPE html><html><head><title>App Scanner</title>'
