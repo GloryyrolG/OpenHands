@@ -44,6 +44,8 @@ bash setup-openhands-klogin-{variant}.sh
 
 脚本自动应用以下补丁（全部在容器 writable layer，`docker restart` 保留，`docker rm -f` 后需重跑脚本）：
 
+> **Patch sentinel 最佳实践**：每个 patch 的"already applied"检查必须用该 patch 注入的**唯一 sentinel 字符串**，而不是可能在文件别处出现的通用字符串。False-positive 会导致 patch 静默跳过但实际未生效（例：`patch_bridge_fixes.py` Fix 3 原来用 `'host.docker.internal' in src` 会命中第 1515 行无关代码，需改为注入的注释行作 sentinel）。
+
 | # | 补丁 | 修改文件 | 解决问题 |
 |---|------|----------|----------|
 | 1 | per-session sandbox 隔离 | `docker_sandbox_service.py` | 每会话独立 sandbox 容器，消除多 sandbox 争端口 8000 → 401 |
@@ -265,3 +267,21 @@ AGENT=$(sudo docker ps --filter name={AGENT_PREFIX} -q | head -1)
 sudo docker exec $AGENT ls /workspace/project/
 # 应看到多个 UUID 子目录，每个对应一个会话
 ```
+
+### App tab 显示 500 Internal Server Error
+
+访问 App tab 时出现 `NameError: name '_PORT_SCAN_HTML' is not defined`。
+
+**原因**：容器 `docker restart` 后 `_PORT_SCAN_HTML` Python 全局变量丢失（patch 12a 注入的常量依赖 app.py 的 writable layer，重启时 Python 进程重载了旧 bytecode 或 patch 未正确持久化）。
+
+**修复**：重新运行 setup 脚本（`bash setup-openhands-klogin-tab.sh`），或单独上传并执行 `patches/patch_port_scan_html.py`。
+
+### MCP 工具不可用（bridge mode 会话）
+
+Agent 无法调用 MCP 工具，日志显示连接到 `http://127.0.0.1:3003/mcp/mcp` 失败。
+
+**原因**：会话的 `meta.json`（`/workspace/conversations/{conv_id}/meta.json`，存储在 oh-tab-* 容器内）保存了旧的 mcp_url（`127.0.0.1`），即使 patch 1.5 已修复 `live_status_app_conversation_service.py`，已有会话的 meta.json 也不会自动更新。
+
+**修复**：
+1. **新建会话**（推荐）：新会话会使用修复后的 `host.docker.internal:...` URL，立即生效。
+2. **手动修改 meta.json**（仅限测试）：`docker exec oh-tab-* cat /workspace/conversations/{id}/meta.json` 找到 `mcp_url` 字段，改为 `host.docker.internal`，然后 `docker restart oh-tab-*`。注意：容器重启后 agent-server 可能会回写 meta.json。
