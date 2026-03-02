@@ -121,9 +121,9 @@ class InMemoryUserStore:
             user_id=user_id,
             email=email,
             username=username,
-            created_at=user_data["created_at"]
+            created_at=str(user_data["created_at"])
         )
-    
+
     async def get_user(self, user_id: str) -> Optional[dict]:
         """获取用户"""
         return self._users.get(user_id)

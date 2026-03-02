@@ -7,12 +7,11 @@
 import os
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from openhands.app_server.config import get_global_config
+from openhands.server.services.auth_service import TokenData, verify_jwt
 from openhands.server.types import AppMode
-from openhands.server.services.auth_service import verify_jwt, TokenData
-
 
 _SESSION_API_KEY = os.getenv('SESSION_API_KEY')
 _SESSION_API_KEY_HEADER = APIKeyHeader(name='X-Session-API-Key', auto_error=False)
@@ -30,25 +29,25 @@ def check_session_api_key(
 
 
 async def get_current_user_from_jwt(
-    credentials: HTTPAuthorizationCredentials = Depends(_jwt_bearer)
+    credentials: HTTPAuthorizationCredentials = Depends(_jwt_bearer),
 ) -> TokenData | None:
     """从 JWT Token 获取当前用户（可选认证）"""
     if not credentials:
         return None
     try:
         return verify_jwt(credentials.credentials)
-    except:
+    except Exception:
         return None
 
 
 async def get_required_user_from_jwt(
-    credentials: HTTPAuthorizationCredentials = Depends(_jwt_bearer)
+    credentials: HTTPAuthorizationCredentials = Depends(_jwt_bearer),
 ) -> TokenData:
     """从 JWT Token 获取当前用户（必须认证）"""
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required",
+            detail='Authentication required',
         )
     return verify_jwt(credentials.credentials)
 

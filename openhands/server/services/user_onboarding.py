@@ -73,7 +73,7 @@ class UserOnboardingService:
     
     async def _create_default_config(self, path: Path, user_id: str, email: str):
         """创建默认配置文件"""
-        default_settings = {
+        default_settings: dict = {
             "language": "zh",
             "agent": "CodeActAgent",
             "max_iterations": None,
