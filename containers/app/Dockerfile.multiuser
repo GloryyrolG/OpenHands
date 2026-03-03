@@ -85,21 +85,24 @@ ENV VIRTUAL_ENV=/app/.venv \
     PYTHONPATH='/app'
 
 COPY --chown=openhands:openhands --from=backend-builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
-RUN chmod -R 770 ${VIRTUAL_ENV}
 
 COPY --chown=openhands:openhands ./skills ./skills
 COPY --chown=openhands:openhands ./openhands ./openhands
 COPY --chown=openhands:openhands pyproject.toml poetry.lock README.md MANIFEST.in LICENSE ./
-RUN chmod -R 770 /app/skills /app/openhands && \
+
+# chmod as root (openhands has sudo but COPY creates dirs that may be root-owned)
+USER root
+RUN chmod -R 770 ${VIRTUAL_ENV} /app/skills /app/openhands && \
     chmod -R 777 /app/openhands/runtime/plugins
+USER openhands
 
 RUN python openhands/core/download.py
 RUN find /app \! -group openhands -exec chgrp openhands {} +
 
 COPY --chown=openhands:openhands --from=frontend-builder /app/build ./frontend/build
-RUN chmod -R 770 /app/frontend
 COPY --chown=openhands:openhands ./containers/app/entrypoint.sh /app/entrypoint.sh
-RUN chmod 770 /app/entrypoint.sh
+USER root
+RUN chmod -R 770 /app/frontend && chmod 770 /app/entrypoint.sh
 
 USER root
 
