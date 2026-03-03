@@ -51,9 +51,13 @@ if ! sudo docker info &>/dev/null 2>&1; then
 fi
 echo "Docker 已安装 ✓"
 
-# 开放防火墙端口
+# 开放防火墙端口（bridge 容器访问宿主机服务需要显式放行）
 sudo ufw allow 3005
 echo "ufw allow 3005 ✓"
+sudo ufw allow 8881
+echo "ufw allow 8881 ✓"
+sudo ufw allow 8882
+echo "ufw allow 8882 ✓"
 
 # 配置 host.docker.internal
 EXTERNAL_IP=\$(hostname -I | awk '{print \$1}')
