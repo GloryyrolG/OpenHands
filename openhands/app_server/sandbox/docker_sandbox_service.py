@@ -189,6 +189,24 @@ class DockerSandboxService(SandboxService):
                                 if matching_port.name == VSCODE:
                                     url += f'/?tkn={session_api_key}&folder={container.attrs["Config"]["WorkingDir"]}'
 
+                                # [OH-MULTI-PERSESSION] Rewrite VSCODE/WORKER URLs to proxy path
+                                # Each container gets unique host ports; route browser through
+                                # /api/sandbox-port/{host_port} for per-session isolation
+                                if (
+                                    self.container_name_prefix == 'oh-multi-'
+                                    and matching_port.name != AGENT_SERVER
+                                ):
+                                    if matching_port.name == VSCODE:
+                                        import urllib.parse as _up
+                                        _parsed = _up.urlparse(url)
+                                        _qs = _up.parse_qs(_parsed.query)
+                                        _folder = _qs.get('folder', [''])[0]
+                                        url = f'/api/sandbox-port/{host_port}/' + (
+                                            f'?folder={_folder}' if _folder else ''
+                                        )
+                                    else:
+                                        url = f'/api/sandbox-port/{host_port}'
+
                                 exposed_urls.append(
                                     ExposedUrl(
                                         name=matching_port.name,
@@ -363,8 +381,18 @@ class DockerSandboxService(SandboxService):
         # Prepare environment variables
         env_vars = sandbox_spec.initial_env.copy()
         env_vars[SESSION_API_KEY_VARIABLE] = session_api_key
+
+        # [OH-MULTI] bridge mode: use OH_WEB_URL port for webhook so agent-server
+        # can call back to the correct openhands app port
+        import re as _re
+        _wh_port = self.host_port
+        if self.container_name_prefix == 'oh-multi-':
+            _web_url = os.environ.get('OH_WEB_URL', '')
+            _m = _re.search(r':(\d+)$', _web_url)
+            if _m:
+                _wh_port = int(_m.group(1))
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
-            f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'
+            f'http://host.docker.internal:{_wh_port}/api/v1/webhooks'
         )
 
         # Set CORS origins for remote browser access when web_url is configured.
@@ -374,20 +402,36 @@ class DockerSandboxService(SandboxService):
             env_vars[ALLOW_CORS_ORIGINS_VARIABLE] = self.web_url
 
         # Prepare port mappings and add port environment variables
-        # When using host network, container ports are directly accessible on the host
-        # so we use the container ports directly instead of mapping to random host ports
+        # [OH-MULTI] bridge mode: force bridge for oh-multi- prefix to avoid port conflicts
+        # when SANDBOX_USE_HOST_NETWORK=true is set globally
         port_mappings: dict[int, int] | None = None
-        if self.use_host_network:
-            # Host network mode: container ports are directly accessible
-            for exposed_port in self.exposed_ports:
-                env_vars[exposed_port.name] = str(exposed_port.container_port)
-        else:
-            # Bridge network mode: map container ports to random host ports
+        if self.container_name_prefix == 'oh-multi-':
+            # Bridge mode: each conversation gets unique host ports via Docker NAT
+            network_mode = None
             port_mappings = {}
             for exposed_port in self.exposed_ports:
                 host_port = self._find_unused_port()
                 port_mappings[exposed_port.container_port] = host_port
                 env_vars[exposed_port.name] = str(exposed_port.container_port)
+                _logger.info(
+                    f'[OH-MULTI] bridge mode: container port {exposed_port.container_port} -> host port {host_port}'
+                )
+        elif self.use_host_network:
+            # Host network mode: container ports are directly accessible
+            network_mode = 'host'
+            for exposed_port in self.exposed_ports:
+                env_vars[exposed_port.name] = str(exposed_port.container_port)
+        else:
+            # Bridge network mode: map container ports to random host ports
+            network_mode = None
+            port_mappings = {}
+            for exposed_port in self.exposed_ports:
+                host_port = self._find_unused_port()
+                port_mappings[exposed_port.container_port] = host_port
+                env_vars[exposed_port.name] = str(exposed_port.container_port)
+
+        if network_mode == 'host':
+            _logger.info(f'Starting sandbox {container_name} with host network mode')
 
         # Prepare labels
         labels = {
@@ -402,12 +446,6 @@ class DockerSandboxService(SandboxService):
             }
             for mount in self.mounts
         }
-
-        # Determine network mode
-        network_mode = 'host' if self.use_host_network else None
-
-        if self.use_host_network:
-            _logger.info(f'Starting sandbox {container_name} with host network mode')
 
         try:
             # Create and start the container
@@ -425,11 +463,10 @@ class DockerSandboxService(SandboxService):
                 # Use Docker's tini init process to ensure proper signal handling and reaping of
                 # zombie child processes.
                 init=True,
-                # Allow agent-server containers to resolve host.docker.internal
-                # and other custom hostnames for LAN deployments
-                # Note: extra_hosts is not needed with host network mode
+                # [OH-MULTI] use network_mode check: oh-multi- forces bridge mode even
+                # when SANDBOX_USE_HOST_NETWORK=true, so apply extra_hosts when not host mode
                 extra_hosts=self.extra_hosts
-                if self.extra_hosts and not self.use_host_network
+                if self.extra_hosts and network_mode != 'host'
                 else None,
                 # Network mode: 'host' for host networking, None for default bridge
                 network_mode=network_mode,
@@ -523,7 +560,7 @@ class DockerSandboxServiceInjector(SandboxServiceInjector):
             'Configure via OH_SANDBOX_HOST_PORT environment variable.'
         ),
     )
-    container_name_prefix: str = 'oh-agent-server-'
+    container_name_prefix: str = os.environ.get('SANDBOX_CONTAINER_PREFIX', 'oh-multi-')
     max_num_sandboxes: int = Field(
         default=5,
         description='Maximum number of sandboxes allowed to run simultaneously',

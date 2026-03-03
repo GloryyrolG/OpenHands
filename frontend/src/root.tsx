@@ -20,6 +20,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <Meta />
         <Links />
+        {/* [OH-MULTI] FakeWS: WebSocket → SSE downgrade for klogin proxy */}
+        {/* eslint-disable-next-line react/no-unknown-property */}
+        <script src="/fakews.js" />
       </head>
       <body>
         {children}

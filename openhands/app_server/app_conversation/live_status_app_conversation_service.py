@@ -237,11 +237,30 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             assert sandbox_spec is not None
 
+            # --- per-conversation workspace isolation ---
+            conv_working_dir = f"{sandbox_spec.working_dir}/{task.id.hex}"
+            _tmp_ws = AsyncRemoteWorkspace(
+                host=agent_server_url,
+                api_key=sandbox.session_api_key,
+                working_dir=sandbox_spec.working_dir,
+            )
+            # Compute workspace root (parent dir, where Changes tab queries git)
+            _ws_root = sandbox_spec.working_dir.rsplit("/", 1)[0]
+            await _tmp_ws.execute_command(
+                f"mkdir -p {conv_working_dir} && "
+                f"([ -d {_ws_root}/.git ] || ("
+                f"git init {_ws_root} && "
+                f"mkdir -p {_ws_root}/.git/info && "
+                f"printf 'bash_events/\\nconversations/\\n' > {_ws_root}/.git/info/exclude))",
+                timeout=15.0,
+            )
+            # --- end per-conversation workspace isolation ---
+
             # Run setup scripts
             remote_workspace = AsyncRemoteWorkspace(
                 host=agent_server_url,
                 api_key=sandbox.session_api_key,
-                working_dir=sandbox_spec.working_dir,
+                working_dir=conv_working_dir,
             )
             async for updated_task in self.run_setup_scripts(
                 task, sandbox, remote_workspace, agent_server_url
@@ -255,7 +274,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     request.initial_message,
                     request.system_message_suffix,
                     request.git_provider,
-                    sandbox_spec.working_dir,
+                    conv_working_dir,  # per-conversation isolated dir
                     request.agent_type,
                     request.llm_model,
                     request.conversation_id,
@@ -730,7 +749,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             return
 
         # Add default OpenHands MCP server
-        mcp_url = f'{self.web_url}/mcp/mcp'
+        # [OH-MULTI] bridge mode: replace 127.0.0.1 with host.docker.internal so
+        # oh-multi- containers (bridge network) can reach the openhands app MCP server
+        mcp_url = f'{self.web_url}/mcp/mcp'.replace(
+            'http://127.0.0.1', 'http://host.docker.internal'
+        )
         mcp_servers['default'] = {'url': mcp_url}
 
         # Add API key if available

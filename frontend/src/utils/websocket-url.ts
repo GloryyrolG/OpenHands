@@ -39,13 +39,35 @@ export function extractPathPrefix(
 }
 
 /**
+ * [OH-MULTI] Checks if a conversation URL points to an agent server on a different host.
+ * Agent server URLs (e.g., http://127.0.0.1:PORT) must be proxied through /agent-server-proxy
+ * in klogin environments where direct browser access to agent containers is blocked.
+ */
+function isAgentServerUrl(conversationUrl: string | null | undefined): boolean {
+  if (!conversationUrl || conversationUrl.startsWith("/")) {
+    return false;
+  }
+  try {
+    const url = new URL(conversationUrl);
+    return url.host !== window.location.host;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Builds the HTTP base URL for V1 API calls
  * @param conversationUrl The conversation URL containing host/port
- * @returns HTTP base URL (e.g., "http://localhost:3000" or "http://localhost:3000/runtime/55313")
+ * @returns HTTP base URL (e.g., "http://localhost:3000" or "/agent-server-proxy" for proxy mode)
  */
 export function buildHttpBaseUrl(
   conversationUrl: string | null | undefined,
 ): string {
+  // [OH-MULTI] Route agent-server calls through proxy when conversation URL is on a different host.
+  // This allows the browser to reach agent containers via klogin's HTTP proxy.
+  if (isAgentServerUrl(conversationUrl)) {
+    return "/agent-server-proxy";
+  }
   const baseHost = extractBaseHost(conversationUrl);
   const pathPrefix = extractPathPrefix(conversationUrl);
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
@@ -64,6 +86,14 @@ export function buildWebSocketUrl(
 ): string | null {
   if (!conversationId) {
     return null;
+  }
+
+  // [OH-MULTI] Route agent-server WebSocket through proxy host.
+  // FakeWS (injected via /fakews.js) intercepts /sockets/events/ URLs and
+  // downgrades them to SSE via /api/proxy/events/{id}/stream
+  if (isAgentServerUrl(conversationUrl)) {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/agent-server-proxy/sockets/events/${conversationId}`;
   }
 
   const baseHost = extractBaseHost(conversationUrl);

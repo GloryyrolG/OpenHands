@@ -65,7 +65,7 @@ class CacheControlMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         if request.url.path.startswith('/assets'):
             # The content of the assets directory has fingerprinted file names so we cache aggressively
-            response.headers['Cache-Control'] = 'public, max-age=2592000, immutable'
+            response.headers['Cache-Control'] = 'no-cache, must-revalidate'
         else:
             response.headers['Cache-Control'] = (
                 'no-cache, no-store, must-revalidate, max-age=0'
@@ -94,7 +94,10 @@ class InMemoryRateLimiter:
         self.history[key] = [ts for ts in self.history[key] if ts > cutoff]
 
     async def __call__(self, request: Request) -> bool:
-        key = request.client.host
+        # klogin proxies all traffic through a single IP; use X-Forwarded-For for real client
+        key = request.headers.get('x-forwarded-for', '').split(',')[0].strip() or (
+            request.client.host if request.client else '127.0.0.1'
+        )
         now = datetime.now()
 
         self._clean_old_requests(key)
@@ -133,7 +136,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
     def is_rate_limited_request(self, request: StarletteRequest) -> bool:
-        if request.url.path.startswith('/assets'):
+        path = request.url.path
+        if path.startswith('/assets'):
             return False
-        # Put Other non rate limited checks here
+        # SSE/streaming: long-lived connections, not rapid requests, skip rate limit
+        if '/sockets/events/' in path and path.endswith('/sse'):
+            return False
+        if '/api/proxy/events/' in path and path.endswith('/stream'):
+            return False
         return True
