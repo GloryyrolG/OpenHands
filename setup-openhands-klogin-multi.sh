@@ -82,6 +82,14 @@ try:
     print(d.get('llm_api_key', ''))
 except: print('')
 " 2>/dev/null)
+CURRENT_BASE_URL=\$(python3 -c "
+import json, os
+try:
+    with open(os.path.expanduser('~/.openhands/settings.json')) as f:
+        d = json.load(f)
+    print(d.get('llm_base_url', ''))
+except: print('')
+" 2>/dev/null)
 MODEL_SLUG=\$(echo "\$CURRENT_MODEL" | sed 's|.*/||')
 
 if [ -n "\$CURRENT_MODEL" ]; then
@@ -143,6 +151,7 @@ sudo docker run -d \
     -e JWT_SECRET=${JWT_SECRET} \
     -e OPENHANDS_DEFAULT_LLM_MODEL="\${CURRENT_MODEL:-}" \
     -e OPENHANDS_DEFAULT_LLM_API_KEY="\${CURRENT_APIKEY:-}" \
+    -e OPENHANDS_DEFAULT_LLM_BASE_URL="\${CURRENT_BASE_URL:-}" \
     -e ENABLE_MCP=false \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v ~/.openhands-multi:/.openhands \
