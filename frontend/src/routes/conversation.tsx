@@ -152,8 +152,13 @@ function AppContent() {
       <EventHandler>
         <div
           data-testid="app-route"
-          className="flex flex-col h-full"
+          className="p-3 md:p-0 flex flex-col h-full gap-3"
         >
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4.5 pt-2 lg:pt-0">
+            <ConversationNameWithStatus />
+            <ConversationTabs />
+          </div>
+
           <ConversationMain />
         </div>
       </EventHandler>
