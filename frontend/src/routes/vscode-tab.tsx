@@ -19,7 +19,12 @@ function VSCodeTab() {
   useEffect(() => {
     if (data?.url) {
       try {
-        const iframeProtocol = new URL(data.url).protocol;
+        // [OH-MULTI] Relative URLs (e.g., /api/sandbox-port/PORT) are same-origin;
+        // resolve against current origin before parsing to avoid "Invalid URL" error.
+        const absoluteUrl = data.url.startsWith("/")
+          ? `${window.location.origin}${data.url}`
+          : data.url;
+        const iframeProtocol = new URL(absoluteUrl).protocol;
         const currentProtocol = window.location.protocol;
 
         // Check if the iframe URL has a different protocol than the current page
