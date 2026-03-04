@@ -1,9 +1,14 @@
 import re
+from typing import Any
 
 import jwt
 from integrations.manager import Manager
 from integrations.models import Message, SourceType
-from integrations.slack.slack_types import SlackViewInterface, StartingConvoException
+from integrations.slack.slack_types import (
+    SlackMessageView,
+    SlackViewInterface,
+    StartingConvoException,
+)
 from integrations.slack.slack_view import (
     SlackFactory,
     SlackNewConversationFromRepoFormView,
@@ -22,7 +27,8 @@ from server.constants import SLACK_CLIENT_ID
 from server.utils.conversation_callback_utils import register_callback_processor
 from slack_sdk.oauth import AuthorizeUrlGenerator
 from slack_sdk.web.async_client import AsyncWebClient
-from storage.database import session_maker
+from sqlalchemy import select
+from storage.database import a_session_maker
 from storage.slack_user import SlackUser
 
 from openhands.core.logger import openhands_logger as logger
@@ -43,7 +49,7 @@ authorize_url_generator = AuthorizeUrlGenerator(
 )
 
 
-class SlackManager(Manager):
+class SlackManager(Manager[SlackViewInterface]):
     def __init__(self, token_manager):
         self.token_manager = token_manager
         self.login_link = (
@@ -63,12 +69,11 @@ class SlackManager(Manager):
     ) -> tuple[SlackUser | None, UserAuth | None]:
         # We get the user and correlate them back to a user in OpenHands - if we can
         slack_user = None
-        with session_maker() as session:
-            slack_user = (
-                session.query(SlackUser)
-                .filter(SlackUser.slack_user_id == slack_user_id)
-                .first()
+        async with a_session_maker() as session:
+            result = await session.execute(
+                select(SlackUser).where(SlackUser.slack_user_id == slack_user_id)
             )
+            slack_user = result.scalar_one_or_none()
 
             # slack_view.slack_to_openhands_user = slack_user # attach user auth info to view
 
@@ -180,7 +185,7 @@ class SlackManager(Manager):
         )
 
         try:
-            slack_view = SlackFactory.create_slack_view_from_payload(
+            slack_view = await SlackFactory.create_slack_view_from_payload(
                 message, slack_user, saas_user_auth
             )
         except Exception as e:
@@ -202,9 +207,7 @@ class SlackManager(Manager):
             msg = self.login_link.format(link)
 
             logger.info('slack_not_yet_authenticated')
-            await self.send_message(
-                self.create_outgoing_message(msg, ephemeral=True), slack_view
-            )
+            await self.send_message(msg, slack_view, ephemeral=True)
             return
 
         if not await self.is_job_requested(message, slack_view):
@@ -212,27 +215,42 @@ class SlackManager(Manager):
 
         await self.start_job(slack_view)
 
-    async def send_message(self, message: Message, slack_view: SlackViewInterface):
+    async def send_message(
+        self,
+        message: str | dict[str, Any],
+        slack_view: SlackMessageView,
+        ephemeral: bool = False,
+    ):
+        """Send a message to Slack.
+
+        Args:
+            message: The message content. Can be a string (for simple text) or
+                     a dict with 'text' and 'blocks' keys (for structured messages).
+            slack_view: The Slack view object containing channel/thread info.
+                        Can be either SlackMessageView (for unauthenticated users)
+                        or SlackViewInterface (for authenticated users).
+            ephemeral: If True, send as an ephemeral message visible only to the user.
+        """
         client = AsyncWebClient(token=slack_view.bot_access_token)
-        if message.ephemeral and isinstance(message.message, str):
+        if ephemeral and isinstance(message, str):
             await client.chat_postEphemeral(
                 channel=slack_view.channel_id,
-                markdown_text=message.message,
+                markdown_text=message,
                 user=slack_view.slack_user_id,
                 thread_ts=slack_view.thread_ts,
             )
-        elif message.ephemeral and isinstance(message.message, dict):
+        elif ephemeral and isinstance(message, dict):
             await client.chat_postEphemeral(
                 channel=slack_view.channel_id,
                 user=slack_view.slack_user_id,
                 thread_ts=slack_view.thread_ts,
-                text=message.message['text'],
-                blocks=message.message['blocks'],
+                text=message['text'],
+                blocks=message['blocks'],
             )
         else:
             await client.chat_postMessage(
                 channel=slack_view.channel_id,
-                markdown_text=message.message,
+                markdown_text=message,
                 thread_ts=slack_view.message_ts,
             )
 
@@ -279,16 +297,13 @@ class SlackManager(Manager):
                     repos, slack_view.message_ts, slack_view.thread_ts
                 ),
             }
-            await self.send_message(
-                self.create_outgoing_message(repo_selection_msg, ephemeral=True),
-                slack_view,
-            )
+            await self.send_message(repo_selection_msg, slack_view, ephemeral=True)
 
             return False
 
         return True
 
-    async def start_job(self, slack_view: SlackViewInterface):
+    async def start_job(self, slack_view: SlackViewInterface) -> None:
         # Importing here prevents circular import
         from server.conversation_callback_processor.slack_callback_processor import (
             SlackCallbackProcessor,
@@ -296,7 +311,7 @@ class SlackManager(Manager):
 
         try:
             msg_info = None
-            user_info: SlackUser = slack_view.slack_to_openhands_user
+            user_info = slack_view.slack_to_openhands_user
             try:
                 logger.info(
                     f'[Slack] Starting job for user {user_info.slack_display_name} (id={user_info.slack_user_id})',
@@ -368,9 +383,10 @@ class SlackManager(Manager):
             except StartingConvoException as e:
                 msg_info = str(e)
 
-            await self.send_message(self.create_outgoing_message(msg_info), slack_view)
+            await self.send_message(msg_info, slack_view)
 
         except Exception:
             logger.exception('[Slack]: Error starting job')
-            msg = 'Uh oh! There was an unexpected error starting the job :('
-            await self.send_message(self.create_outgoing_message(msg), slack_view)
+            await self.send_message(
+                'Uh oh! There was an unexpected error starting the job :(', slack_view
+            )

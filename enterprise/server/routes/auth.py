@@ -3,7 +3,7 @@ import json
 import uuid
 import warnings
 from datetime import datetime, timezone
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Literal, Optional, cast
 from urllib.parse import quote
 from uuid import UUID as parse_uuid
 
@@ -34,7 +34,8 @@ from server.services.org_invitation_service import (
     OrgInvitationService,
     UserAlreadyMemberError,
 )
-from storage.database import session_maker
+from sqlalchemy import select
+from storage.database import a_session_maker
 from storage.user import User
 from storage.user_store import UserStore
 
@@ -188,34 +189,35 @@ async def keycloak_callback(
 
     user_info = await token_manager.get_user_info(keycloak_access_token)
     logger.debug(f'user_info: {user_info}')
-    if ROLE_CHECK_ENABLED and 'roles' not in user_info:
+    if ROLE_CHECK_ENABLED and user_info.roles is None:
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={'error': 'Missing required role'},
         )
 
-    if 'sub' not in user_info or 'preferred_username' not in user_info:
+    if user_info.preferred_username is None:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={'error': 'Missing user ID or username in response'},
         )
 
-    email = user_info.get('email')
-    user_id = user_info['sub']
-    user = await UserStore.get_user_by_id_async(user_id)
+    email = user_info.email
+    user_id = user_info.sub
+    user_info_dict = user_info.model_dump(exclude_none=True)
+    user = await UserStore.get_user_by_id(user_id)
     if not user:
-        user = await UserStore.create_user(user_id, user_info)
+        user = await UserStore.create_user(user_id, user_info_dict)
     else:
         # Existing user — gradually backfill contact_name if it still has a username-style value
-        await UserStore.backfill_contact_name(user_id, user_info)
-        await UserStore.backfill_user_email(user_id, user_info)
+        await UserStore.backfill_contact_name(user_id, user_info_dict)
+        await UserStore.backfill_user_email(user_id, user_info_dict)
 
     if not user:
-        logger.error(f'Failed to authenticate user {user_info["preferred_username"]}')
+        logger.error(f'Failed to authenticate user {user_info.preferred_username}')
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={
-                'error': f'Failed to authenticate user {user_info["preferred_username"]}'
+                'error': f'Failed to authenticate user {user_info.preferred_username}'
             },
         )
 
@@ -270,7 +272,7 @@ async def keycloak_callback(
             # Fail open - continue with login if reCAPTCHA service unavailable
 
     # Check if email domain is blocked
-    if email and domain_blocker.is_domain_blocked(email):
+    if email and await domain_blocker.is_domain_blocked(email):
         logger.warning(
             f'Blocked authentication attempt for email: {email}, user_id: {user_id}'
         )
@@ -322,7 +324,7 @@ async def keycloak_callback(
             )
 
     # Check email verification status
-    email_verified = user_info.get('email_verified', False)
+    email_verified = user_info.email_verified or False
     if not email_verified:
         # Send verification email
         # Import locally to avoid circular import with email.py
@@ -340,7 +342,7 @@ async def keycloak_callback(
 
     # default to github IDP for now.
     # TODO: remove default once Keycloak is updated universally with the new attribute.
-    idp: str = user_info.get('identity_provider', ProviderType.GITHUB.value)
+    idp: str = user_info.identity_provider or ProviderType.GITHUB.value
     logger.info(f'Full IDP is {idp}')
     idp_type = 'oidc'
     if ':' in idp:
@@ -351,7 +353,7 @@ async def keycloak_callback(
         ProviderType(idp), user_id, keycloak_access_token
     )
 
-    username = user_info['preferred_username']
+    username = user_info.preferred_username
     if user_verifier.is_active() and not user_verifier.is_user_allowed(username):
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -359,7 +361,7 @@ async def keycloak_callback(
         )
 
     valid_offline_token = (
-        await token_manager.validate_offline_token(user_id=user_info['sub'])
+        await token_manager.validate_offline_token(user_id=user_info.sub)
         if idp_type != 'saml'
         else True
     )
@@ -540,14 +542,10 @@ async def keycloak_offline_callback(code: str, state: str, request: Request):
 
     user_info = await token_manager.get_user_info(keycloak_access_token)
     logger.debug(f'user_info: {user_info}')
-    if 'sub' not in user_info:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={'error': 'Missing Keycloak ID in response'},
-        )
+    # sub is a required field in KeycloakUserInfo, validation happens in get_user_info
 
     await token_manager.store_offline_token(
-        user_id=user_info['sub'], offline_token=keycloak_refresh_token
+        user_id=user_info.sub, offline_token=keycloak_refresh_token
     )
 
     redirect_url, _, _ = _extract_oauth_state(state)
@@ -590,7 +588,7 @@ async def authenticate(request: Request):
 
 @api_router.post('/accept_tos')
 async def accept_tos(request: Request):
-    user_auth: SaasUserAuth = await get_user_auth(request)
+    user_auth = cast(SaasUserAuth, await get_user_auth(request))
     access_token = await user_auth.get_access_token()
     refresh_token = user_auth.refresh_token
     user_id = await user_auth.get_user_id()
@@ -609,18 +607,21 @@ async def accept_tos(request: Request):
     redirect_url = body.get('redirect_url', str(request.base_url))
 
     # Update user settings with TOS acceptance
-    accepted_tos: datetime = datetime.now(timezone.utc)
-    with session_maker() as session:
-        user = session.query(User).filter(User.id == uuid.UUID(user_id)).first()
+    accepted_tos: datetime = datetime.now(timezone.utc).replace(tzinfo=None)
+    async with a_session_maker() as session:
+        result = await session.execute(
+            select(User).where(User.id == uuid.UUID(user_id))
+        )
+        user = result.scalar_one_or_none()
         if not user:
-            session.rollback()
+            await session.rollback()
             logger.error('User for {user_id} not found.')
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 content={'error': 'User does not exist'},
             )
         user.accepted_tos = accepted_tos
-        session.commit()
+        await session.commit()
 
         logger.info(f'User {user_id} accepted TOS')
 
@@ -656,7 +657,7 @@ async def logout(request: Request):
 
     # Try to properly logout from Keycloak, but don't fail if it doesn't work
     try:
-        user_auth: SaasUserAuth = await get_user_auth(request)
+        user_auth = cast(SaasUserAuth, await get_user_auth(request))
         if user_auth and user_auth.refresh_token:
             refresh_token = user_auth.refresh_token.get_secret_value()
             await token_manager.logout(refresh_token)

@@ -9183,38 +9183,7 @@
     "de": "Abonnement kündigen",
     "uk": "Скасувати підписку"
   },
-  "PAYMENT$CANCEL_SUBSCRIPTION_MESSAGE": {
-    "en": "Are you sure you want to cancel your subscription? You will lose access to premium features at the end of your current billing period.",
-    "ja": "サブスクリプションをキャンセルしてもよろしいですか？現在の請求期間の終了時にプレミアム機能へのアクセスを失います。",
-    "zh-CN": "您确定要取消订阅吗？您将在当前计费周期结束时失去对高级功能的访问权限。",
-    "zh-TW": "您確定要取消訂閱嗎？您將在當前計費週期結束時失去對高級功能的訪問權限。",
-    "ko-KR": "구독을 취소하시겠습니까? 현재 결제 기간이 끝나면 프리미엄 기능에 대한 액세스를 잃게 됩니다.",
-    "no": "Er du sikker på at du vil avbryte abonnementet? Du vil miste tilgang til premium-funksjoner ved slutten av gjeldende faktureringsperiode.",
-    "it": "Sei sicuro di voler annullare l'abbonamento? Perderai l'accesso alle funzionalità premium alla fine del periodo di fatturazione corrente.",
-    "pt": "Tem certeza de que deseja cancelar sua assinatura? Você perderá o acesso aos recursos premium no final do período de cobrança atual.",
-    "es": "¿Estás seguro de que quieres cancelar tu suscripción? Perderás el acceso a las funciones premium al final de tu período de facturación actual.",
-    "ar": "هل أنت متأكد من أنك تريد إلغاء اشتراكك؟ ستفقد الوصول إلى الميزات المميزة في نهاية فترة الفوترة الحالية.",
-    "fr": "Êtes-vous sûr de vouloir annuler votre abonnement ? Vous perdrez l'accès aux fonctionnalités premium à la fin de votre période de facturation actuelle.",
-    "tr": "Aboneliğinizi iptal etmek istediğinizden emin misiniz? Mevcut faturalama döneminizin sonunda premium özelliklere erişiminizi kaybedeceksiniz.",
-    "de": "Sind Sie sicher, dass Sie Ihr Abonnement kündigen möchten? Sie verlieren den Zugang zu Premium-Funktionen am Ende Ihres aktuellen Abrechnungszeitraums.",
-    "uk": "Ві впевнені, що хочете скасувати підписку? Ви втратите доступ до преміум-функцій наприкінці поточного розрахункового періоду."
-  },
-  "PAYMENT$CANCEL_SUBSCRIPTION_MESSAGE_WITH_DATE": {
-    "en": "Are you sure you want to cancel your subscription? You will lose access to premium features on {{date}}.",
-    "ja": "サブスクリプションをキャンセルしてもよろしいですか？{{date}}にプレミアム機能へのアクセスを失います。",
-    "zh-CN": "您确定要取消订阅吗？您将在{{date}}失去对高级功能的访问权限。",
-    "zh-TW": "您確定要取消訂閱嗎？您將在{{date}}失去對高級功能的訪問權限。",
-    "ko-KR": "구독을 취소하시겠습니까? {{date}}에 프리미엄 기능에 대한 액세스를 잃게 됩니다.",
-    "no": "Er du sikker på at du vil avbryte abonnementet? Du vil miste tilgang til premium-funksjoner {{date}}.",
-    "it": "Sei sicuro di voler annullare l'abbonamento? Perderai l'accesso alle funzionalità premium il {{date}}.",
-    "pt": "Tem certeza de que deseja cancelar sua assinatura? Você perderá o acesso aos recursos premium em {{date}}.",
-    "es": "¿Estás seguro de que quieres cancelar tu suscripción? Perderás el acceso a las funciones premium el {{date}}.",
-    "ar": "هل أنت متأكد من أنك تريد إلغاء اشتراكك؟ ستفقد الوصول إلى الميزات المميزة في {{date}}.",
-    "fr": "Êtes-vous sûr de vouloir annuler votre abonnement ? Vous perdrez l'accès aux fonctionnalités premium le {{date}}.",
-    "tr": "Aboneliğinizi iptal etmek istediğinizden emin misiniz? {{date}} tarihinde premium özelliklere erişiminizi kaybedeceksiniz.",
-    "de": "Sind Sie sicher, dass Sie Ihr Abonnement kündigen möchten? Sie verlieren den Zugang zu Premium-Funktionen am {{date}}.",
-    "uk": "Ви впевнені, що хочете скасувати підписку? Ви втратите доступ до преміум-функцій {{date}}."
-  },
+
   "PAYMENT$SUBSCRIPTION_CANCELLED": {
     "en": "Subscription cancelled successfully",
     "ja": "サブスクリプションが正常にキャンセルされました",
@@ -9231,22 +9200,7 @@
     "de": "Abonnement erfolgreich gekündigt",
     "uk": "Підписку успішно скасовано"
   },
-  "PAYMENT$SUBSCRIPTION_CANCELLED_EXPIRES": {
-    "en": "Your subscription has been cancelled and will expire on {{date}}",
-    "ja": "サブスクリプションはキャンセルされ、{{date}}に期限切れになります",
-    "zh-CN": "您的订阅已取消，将于{{date}}到期",
-    "zh-TW": "您的訂閱已取消，將於{{date}}到期",
-    "ko-KR": "구독이 취소되었으며 {{date}}에 만료됩니다",
-    "no": "Abonnementet ditt er avbrutt og utløper {{date}}",
-    "it": "Il tuo abbonamento è stato annullato e scadrà il {{date}}",
-    "pt": "Sua assinatura foi cancelada e expirará em {{date}}",
-    "es": "Tu suscripción ha sido cancelada y expirará el {{date}}",
-    "ar": "تم إلغاء اشتراكك وسينتهي في {{date}}",
-    "fr": "Votre abonnement a été annulé et expirera le {{date}}",
-    "tr": "Aboneliğiniz iptal edildi ve {{date}} tarihinde sona erecek",
-    "de": "Ihr Abonnement wurde gekündigt und läuft am {{date}} ab",
-    "uk": "Ваша підписка скасована і закінчиться {{date}}"
-  },
+
   "PAYMENT$NEXT_BILLING_DATE": {
     "en": "Next billing date: {{date}}",
     "ja": "次回請求日: {{date}}",
@@ -9806,6 +9760,22 @@
     "fr": "Se connecter à Bitbucket",
     "tr": "Bitbucket'a bağlan",
     "uk": "Увійти за допомогою Bitbucket"
+  },
+  "BITBUCKET_DATA_CENTER$CONNECT_TO_BITBUCKET_DATA_CENTER": {
+    "en": "Log in with Bitbucket Data Center",
+    "ja": "Bitbucket Data Centerに接続",
+    "zh-CN": "连接到Bitbucket Data Center",
+    "zh-TW": "連接到Bitbucket Data Center",
+    "ko-KR": "Bitbucket Data Center에 연결",
+    "de": "Mit Bitbucket Data Center verbinden",
+    "no": "Koble til Bitbucket Data Center",
+    "it": "Connetti a Bitbucket Data Center",
+    "pt": "Conectar ao Bitbucket Data Center",
+    "es": "Conectar a Bitbucket Data Center",
+    "ar": "الاتصال بـ Bitbucket Data Center",
+    "fr": "Se connecter à Bitbucket Data Center",
+    "tr": "Bitbucket Data Center'a bağlan",
+    "uk": "Увійти за допомогою Bitbucket Data Center"
   },
   "ENTERPRISE_SSO$CONNECT_TO_ENTERPRISE_SSO": {
     "en": "Login with Enterprise SSO",
@@ -10414,6 +10384,54 @@
     "tr": "talimatlar için buraya tıklayın",
     "de": "klicken Sie hier für Anweisungen",
     "uk": "натисніть тут, щоб отримати інструкції"
+  },
+    "BITBUCKET_DATA_CENTER$TOKEN_LABEL": {
+    "en": "Bitbucket Data Center Token",
+    "ja": "Bitbucket Data Centerトークン",
+    "zh-CN": "Bitbucket Data Center令牌",
+    "zh-TW": "Bitbucket Data Center權杖",
+    "ko-KR": "Bitbucket Data Center 토큰",
+    "no": "Bitbucket Data Center-token",
+    "ar": "رمز Bitbucket Data Center",
+    "de": "Bitbucket Data Center-Token",
+    "fr": "Jeton Bitbucket Data Center",
+    "it": "Token Bitbucket Data Center",
+    "pt": "Token do Bitbucket Data Center",
+    "es": "Token de Bitbucket Data Center",
+    "tr": "Bitbucket Data Center Token",
+    "uk": "Токен Bitbucket Data Center"
+  },
+  "BITBUCKET_DATA_CENTER$HOST_LABEL": {
+    "en": "Bitbucket Data Center Host",
+    "ja": "Bitbucket Data Centerホスト",
+    "zh-CN": "Bitbucket Data Center主机",
+    "zh-TW": "Bitbucket Data Center主機",
+    "ko-KR": "Bitbucket Data Center 호스트",
+    "no": "Bitbucket Data Center-vert",
+    "ar": "مضيف Bitbucket Data Center",
+    "de": "Bitbucket Data Center-Host",
+    "fr": "Hôte Bitbucket Data Center",
+    "it": "Host Bitbucket Data Center",
+    "pt": "Host do Bitbucket Data Center",
+    "es": "Host de Bitbucket Data Center",
+    "tr": "Bitbucket Data Center Sunucu",
+    "uk": "Хост Bitbucket Data Center"
+  },
+  "BITBUCKET_DATA_CENTER$TOKEN_HELP_TEXT": {
+    "en": "Create an <0>HTTP access token</0> in your Bitbucket Data Center instance with repository read/write and pull request read/write permissions. For personal access tokens, use the format 'username:token'. For project tokens, use the format 'x-token-auth:your-token'.",
+    "ja": "リポジトリの読み取り/書き込みおよびプルリクエストの読み取り/書き込み権限を持つBitbucket Data Centerインスタンスで<0>HTTPアクセストークン</0>を作成してください。個人アクセストークンの場合は、'username:token'の形式を使用してください。プロジェクトトークンの場合は、'x-token-auth:your-token'の形式を使用してください。",
+    "zh-CN": "在您的Bitbucket Data Center实例中创建一个具有仓库读写和拉取请求读写权限的<0>HTTP访问令牌</0>。对于个人访问令牌，请使用格式'username:token'。对于项目令牌，请使用格式'x-token-auth:your-token'。",
+    "zh-TW": "在您的Bitbucket Data Center實例中建立一個具有儲存庫讀寫和拉取請求讀寫權限的<0>HTTP存取權杖</0>。對於個人存取權杖，請使用格式'username:token'。對於專案權杖，請使用格式'x-token-auth:your-token'。",
+    "ko-KR": "Bitbucket Data Center 인스턴스에서 저장소 읽기/쓰기 및 풀 리퀘스트 읽기/쓰기 권한이 있는 <0>HTTP 액세스 토큰</0>을 생성하세요. 개인 액세스 토큰의 경우 'username:token' 형식을 사용하세요. 프로젝트 토큰의 경우 'x-token-auth:your-token' 형식을 사용하세요.",
+    "no": "Opprett et <0>HTTP-tilgangstoken</0> i din Bitbucket Data Center-instans med lese-/skrivetilgang til repositorier og pull-forespørsler. For personlige tilgangstokener, bruk formatet 'username:token'. For prosjekttokener, bruk formatet 'x-token-auth:your-token'.",
+    "ar": "أنشئ <0>رمز وصول HTTP</0> في مثيل Bitbucket Data Center الخاص بك مع أذونات قراءة/كتابة للمستودع وقراءة/كتابة لطلبات السحب. لرموز الوصول الشخصية، استخدم التنسيق 'username:token'. لرموز المشروع، استخدم التنسيق 'x-token-auth:your-token'.",
+    "de": "Erstellen Sie ein <0>HTTP-Zugriffstoken</0> in Ihrer Bitbucket Data Center-Instanz mit Lese-/Schreibberechtigungen für Repositories und Pull Requests. Geben Sie für persönliche Zugriffstoken das Format 'username:token' ein. Geben Sie für Projekt-Token das Format 'x-token-auth:your-token' ein.",
+    "fr": "Créez un <0>jeton d'accès HTTP</0> dans votre instance Bitbucket Data Center avec des permissions de lecture/écriture sur les dépôts et les pull requests. Pour les jetons d'accès personnels, utilisez le format 'username:token'. Pour les jetons de projet, utilisez le format 'x-token-auth:your-token'.",
+    "it": "Crea un <0>token di accesso HTTP</0> nella tua istanza Bitbucket Data Center con permessi di lettura/scrittura per repository e pull request. Per i token di accesso personali, usa il formato 'username:token'. Per i token di progetto, usa il formato 'x-token-auth:your-token'.",
+    "pt": "Crie um <0>token de acesso HTTP</0> na sua instância do Bitbucket Data Center com permissões de leitura/gravação de repositório e pull request. Para tokens de acesso pessoal, use o formato 'username:token'. Para tokens de projeto, use o formato 'x-token-auth:your-token'.",
+    "es": "Cree un <0>token de acceso HTTP</0> en su instancia de Bitbucket Data Center con permisos de lectura/escritura de repositorio y pull request. Para los tokens de acceso personal, use el formato 'username:token'. Para los tokens de proyecto, use el formato 'x-token-auth:your-token'.",
+    "tr": "Bitbucket Data Center örneğinizde depo okuma/yazma ve pull request okuma/yazma izinlerine sahip bir <0>HTTP erişim jetonu</0> oluşturun. Kişisel erişim jetonları için 'username:token' biçimini kullanın. Proje jetonları için 'x-token-auth:your-token' biçimini kullanın.",
+    "uk": "Створіть <0>HTTP-токен доступу</0> у вашому екземплярі Bitbucket Data Center з правами читання/запису репозиторію та pull request. Для особистих токенів доступу використовуйте формат 'username:token'. Для токенів проекту використовуйте формат 'x-token-auth:your-token'."
   },
   "GITLAB$OR_SEE": {
     "en": "or see the",
@@ -11599,6 +11617,56 @@
     "de": "Ein Repository auswählen",
     "uk": "Вибрати репозиторій"
   },
+  "TASKS$NO_GIT_PROVIDERS_TITLE": {
+    "en": "Connect a Git provider",
+    "ja": "Gitプロバイダーを接続",
+    "zh-CN": "连接 Git 提供商",
+    "zh-TW": "連接 Git 提供商",
+    "ko-KR": "Git 제공자 연결",
+    "no": "Koble til en Git-leverandør",
+    "ar": "قم بتوصيل موفر Git",
+    "de": "Git-Anbieter verbinden",
+    "fr": "Connecter un fournisseur Git",
+    "it": "Collega un provider Git",
+    "pt": "Conectar um provedor Git",
+    "es": "Conectar un proveedor Git",
+    "tr": "Git sağlayıcısını bağla",
+    "uk": "Підключити постачальник Git"
+  },
+
+  "TASKS$NO_GIT_PROVIDERS_DESCRIPTION": {
+    "en": "Connect a Git provider to see suggested tasks from your repositories.",
+    "ja": "Gitプロバイダーを接続して、リポジトリからの提案タスクを表示します。",
+    "zh-CN": "连接 Git 提供商以查看来自存储库的建议任务。",
+    "zh-TW": "連接 Git 提供商以查看來自存儲庫的建議任務。",
+    "ko-KR": "Git 제공자를 연결하여 저장소의 추천 작업을 확인하세요.",
+    "no": "Koble til en Git-leverandør for å se foreslåtte oppgaver fra dine repositorier.",
+    "ar": "قم بتوصيل موفر Git لرؤية المهام المقترحة من مستودعاتك.",
+    "de": "Verbinde einen Git-Anbieter, um vorgeschlagene Aufgaben aus deinen Repositories zu sehen.",
+    "fr": "Connectez un fournisseur Git pour voir les tâches suggérées depuis vos dépôts.",
+    "it": "Collega un provider Git per vedere le attività suggerite dai tuoi repository.",
+    "pt": "Conecte um provedor Git para ver tarefas sugeridas dos seus repositórios.",
+    "es": "Conecta un proveedor Git para ver tareas sugeridas de tus repositorios.",
+    "tr": "Depolarınızdan önerilen görevleri görmek için bir Git sağlayıcısı bağlayın.",
+    "uk": "Підключіть постачальник Git, щоб бачити запропоновані завдання з ваших репозиторіїв."
+  },
+
+  "TASKS$NO_GIT_PROVIDERS_CTA": {
+    "en": "Go to Integrations",
+    "ja": "統合へ移動",
+    "zh-CN": "前往集成",
+    "zh-TW": "前往整合",
+    "ko-KR": "통합으로 이동",
+    "no": "Gå til integrasjoner",
+    "ar": "الانتقال إلى التكاملات",
+    "de": "Zu Integrationen",
+    "fr": "Aller aux intégrations",
+    "it": "Vai alle integrazioni",
+    "pt": "Ir para integrações",
+    "es": "Ir a integraciones",
+    "tr": "Entegrasyonlara git",
+    "uk": "Перейти до інтеграцій"
+  },
   "TASKS$SUGGESTED_TASKS": {
     "en": "Suggested Tasks",
     "ja": "推奨タスク",
@@ -11710,6 +11778,22 @@
     "tr": "Bitbucket token daha fazla görme bağlantısı",
     "de": "Bitbucket-Token mehr sehen Link",
     "uk": "Посилання для перегляду більше про токен Bitbucket"
+  },
+  "GIT$BITBUCKET_DC_TOKEN_HELP_LINK": {
+    "en": "Bitbucket Data Center HTTP access token docs",
+    "ja": "Bitbucket Data Center HTTPアクセストークンドキュメント",
+    "zh-CN": "Bitbucket Data Center HTTP访问令牌文档",
+    "zh-TW": "Bitbucket Data Center HTTP存取權杖文件",
+    "ko-KR": "Bitbucket Data Center HTTP 액세스 토큰 문서",
+    "no": "Bitbucket Data Center HTTP-tilgangstoken-dokumentasjon",
+    "ar": "وثائق رمز وصول HTTP لـ Bitbucket Data Center",
+    "de": "Bitbucket Data Center HTTP-Zugriffstoken-Dokumentation",
+    "fr": "Documentation du jeton d'accès HTTP Bitbucket Data Center",
+    "it": "Documentazione token di accesso HTTP Bitbucket Data Center",
+    "pt": "Documentação do token de acesso HTTP do Bitbucket Data Center",
+    "es": "Documentación del token de acceso HTTP de Bitbucket Data Center",
+    "tr": "Bitbucket Data Center HTTP erişim jetonu belgeleri",
+    "uk": "Документація HTTP-токена доступу Bitbucket Data Center"
   },
   "GIT$GITHUB_TOKEN_HELP_LINK": {
     "en": "GitHub token help link",
