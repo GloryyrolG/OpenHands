@@ -244,14 +244,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 api_key=sandbox.session_api_key,
                 working_dir=sandbox_spec.working_dir,
             )
-            # Compute workspace root (parent dir, where Changes tab queries git)
-            _ws_root = sandbox_spec.working_dir.rsplit("/", 1)[0]
+            # Init git at sandbox_spec.working_dir (the V1 agent-server workspace root)
+            _ws_root = sandbox_spec.working_dir
             await _tmp_ws.execute_command(
                 f"mkdir -p {conv_working_dir} && "
                 f"([ -d {_ws_root}/.git ] || ("
                 f"git init {_ws_root} && "
                 f"mkdir -p {_ws_root}/.git/info && "
-                f"printf 'bash_events/\\nconversations/\\n' > {_ws_root}/.git/info/exclude))",
+                f"printf '*\\n!*/\\n' > {_ws_root}/.git/info/exclude))",
                 timeout=15.0,
             )
             # --- end per-conversation workspace isolation ---

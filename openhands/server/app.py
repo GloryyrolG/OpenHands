@@ -225,7 +225,7 @@ _PORT_SCAN_HTML = (
     '<h3 id="m">Scanning for running app...</h3>'
     '<p id="sub" style="color:#aaa;font-size:.85rem"></p></div>'
     '<script>'
-    'const ports=[3000,5000,7860,8000,8008,8080,8501,8502,8503,8504,8888,9000];'
+    'const ports=[3000,4173,5000,5173,7860,8000,8008,8011,8080,8501,8502,8503,8504,8888,9000];'
     'const _ctxM=window.location.pathname.match(/sandbox-port\\/(\\d+)/);'
     'const _ctx=_ctxM?_ctxM[1]:null;'
     'function _purl(p){return _ctx?"/api/sandbox-port/"+_ctx+"/scan/"+p+"/":"/api/sandbox-port/"+p+"/";}'
@@ -271,6 +271,16 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
             _cdata2 = _gcfp2(port)
             _cip2 = _cdata2.get('NetworkSettings', {}).get('IPAddress', '')
             if _cip2:
+                # For full page loads (not scan probes), redirect to Docker NAT host port
+                # so the main proxy handler does proper URL rewriting for assets
+                if request.headers.get('x-oh-tab-scan') != '1' and not _sp_path:
+                    _port_bindings = _cdata2.get('NetworkSettings', {}).get('Ports', {})
+                    _nat_info = _port_bindings.get(f'{_sp_port}/tcp', [])
+                    if _nat_info:
+                        _host_port = _nat_info[0].get('HostPort', '')
+                        if _host_port:
+                            from starlette.responses import RedirectResponse as _RR3
+                            return _RR3(url=f'/api/sandbox-port/{_host_port}/', status_code=302)
                 _scan_target = f'http://{_cip2}:{_sp_port}/{_sp_path}'
                 _qs2 = str(request.query_params)
                 if _qs2:
@@ -286,15 +296,18 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
                     from starlette.responses import Response as _Resp2
                     _scan_hdrs = {k: v for k, v in _r2.headers.multi_items()
                                   if k.lower() not in ('content-encoding', 'transfer-encoding',
-                                                        'connection', 'content-security-policy')}
+                                                        'connection', 'content-security-policy',
+                                                        'content-length')}
                     return _Resp2(content=_r2.content, status_code=_r2.status_code,
                                   headers=_scan_hdrs, media_type=_r2.headers.get('content-type', ''))
                 except Exception as _se:
                     from starlette.responses import Response as _Resp2
-                    if request.headers.get('x-oh-multi-scan') != '1':
-                        from starlette.responses import HTMLResponse as _HtmlResp
-                        return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)
-                    return _Resp2(content=str(_se), status_code=502)
+                    if request.headers.get('x-oh-tab-scan') == '1':
+                        # Scan sub-request: return 502 so tryPort() returns false
+                        return _Resp2(content=str(_se), status_code=502)
+                    # Direct browser access: show scan page
+                    from starlette.responses import HTMLResponse as _HtmlResp
+                    return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)
 
     import httpx as _hx, re as _re
     # Low ports (<20000) are container-internal; high ports are Docker NAT-mapped
@@ -329,7 +342,7 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
             resp_headers = {}
             for k, v in resp.headers.multi_items():
                 if k.lower() in ('content-encoding', 'transfer-encoding', 'connection',
-                                  'content-security-policy'):
+                                  'content-security-policy', 'content-length'):
                     continue
                 if k.lower() == 'location':
                     if v.startswith('http://127.0.0.1') or v.startswith('http://localhost'):
@@ -342,30 +355,39 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
             # If agent server JSON at root GET, show scan page
             if (resp.status_code == 200 and request.method == 'GET' and not path
                     and 'application/json' in ct
-                    and request.headers.get('x-oh-multi-scan') != '1'
+                    and request.headers.get('x-oh-tab-scan') != '1'
                     and b'"OpenHands Agent Server"' in content[:200]):
                 from starlette.responses import HTMLResponse as _HtmlResp
                 return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)
-            if 'text/html' in ct and content:
+            _is_js = any(t in ct for t in ('javascript', 'ecmascript'))
+            if (_is_js or 'text/html' in ct) and content:
                 try:
                     html = content.decode('utf-8')
+                    if 'text/html' in ct:
+                        def _rewrite_abs(m):
+                            attr, url = m.group(1), m.group(2)
+                            if url.startswith(proxy_base):
+                                return m.group(0)
+                            return attr + proxy_base + url
 
-                    def _rewrite_abs(m):
-                        attr, url = m.group(1), m.group(2)
+                        html = _re.sub(r"""((?:src|href|action)=["'])(/[^/"'#][^"']*)""", _rewrite_abs, html)
+                        html = html.replace(
+                            '&quot;serverBasePath&quot;:&quot;/&quot;',
+                            '&quot;serverBasePath&quot;:&quot;' + proxy_base + '/&quot;')
+                    if not _is_js:
+                        html = _re.sub(
+                            r"(new URL\(')(/stable-[^']+)(')",
+                            lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3), html)
+                        html = _re.sub(
+                            r'&quot;remoteAuthority&quot;:&quot;[^&]*&quot;',
+                            '&quot;remoteAuthority&quot;:&quot;&quot;', html)
+                    # Rewrite JS/HTML import/from absolute paths: import "/xxx" → import "/api/sandbox-port/{port}/xxx"
+                    def _rewrite_import(m):
+                        prefix, url, suffix = m.group(1), m.group(2), m.group(3)
                         if url.startswith(proxy_base):
                             return m.group(0)
-                        return attr + proxy_base + url
-
-                    html = _re.sub(r"""((?:src|href|action)=["'])(/[^/"'#][^"']*)""", _rewrite_abs, html)
-                    html = html.replace(
-                        '&quot;serverBasePath&quot;:&quot;/&quot;',
-                        '&quot;serverBasePath&quot;:&quot;' + proxy_base + '/&quot;')
-                    html = _re.sub(
-                        r"(new URL\(')(/stable-[^']+)(')",
-                        lambda m: m.group(1) + proxy_base + m.group(2) + m.group(3), html)
-                    html = _re.sub(
-                        r'&quot;remoteAuthority&quot;:&quot;[^&]*&quot;',
-                        '&quot;remoteAuthority&quot;:&quot;&quot;', html)
+                        return prefix + proxy_base + url + suffix
+                    html = _re.sub(r'''((?:import|from)\s*["'])(/[^"']+)(["'])''', _rewrite_import, html)
                     content = html.encode('utf-8')
                 except Exception:
                     pass
@@ -375,7 +397,7 @@ async def sandbox_port_proxy(port: int, path: str, request: Request):
     except Exception as e:
         # Return auto-scan page for ANY error at root GET (not for probe requests)
         if (request.method == 'GET' and not path
-                and request.headers.get('x-oh-multi-scan') != '1'):
+                and request.headers.get('x-oh-tab-scan') != '1'):
             from starlette.responses import HTMLResponse as _HtmlResp
             return _HtmlResp(content=_PORT_SCAN_HTML, status_code=200)
         from starlette.responses import Response as _Resp
