@@ -138,9 +138,12 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
         yield ':heartbeat\n\n'  # flush headers immediately
         connected = False
         _base_qs = '&'.join(f'{k}={v}' for k, v in params.items() if k != 'resend_all')
-        for attempt in range(30):  # retry up to 90s while conversation starts
+        # Keep SSE alive indefinitely: reconnect WS on disconnect, send heartbeats.
+        # Client disconnect cancels the generator via CancelledError.
+        fail_count = 0
+        while fail_count < 600:  # ~30 min max idle (600 * 3s)
             try:
-                _url = ws_url if attempt == 0 else (
+                _url = ws_url if not connected else (
                     f"{_gtau(conversation_id).replace('http://', 'ws://')}/sockets/events/{conversation_id}"
                     + (f'?{_base_qs}' if _base_qs else '')
                 )
@@ -148,6 +151,7 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
                     if not connected:
                         yield 'data: __connected__\n\n'
                         connected = True
+                    fail_count = 0  # reset on successful connect
                     while True:  # heartbeat prevents klogin 60s idle timeout
                         try:
                             msg = await _asyncio.wait_for(ws.recv(), timeout=15)
@@ -158,9 +162,11 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
                             yield ':heartbeat\n\n'
                         except Exception:
                             break
-                    return
+                    # WS closed — don't end SSE, reconnect after brief wait
             except Exception:
                 pass
+            fail_count += 1
+            yield ':heartbeat\n\n'
             await _asyncio.sleep(3)
         yield 'data: __closed__\n\n'
 
