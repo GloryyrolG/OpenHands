@@ -312,8 +312,15 @@ async def proxy_http(request: Request, path: str):
         agent_base = _get_tab_agent_url(conv_id)
     else:
         agent_base = f"http://127.0.0.1:{_get_agent_server_port()}"
+    # Upstream frontend sends git changes as query param (?path=...) but
+    # agent-server expects path in URL (/api/git/changes/{workspace_path}).
+    # Convert query param to URL path to avoid 307 redirect loop.
+    if path.rstrip('/') == "api/git/changes" and "path" in dict(request.query_params):
+        workspace_path = dict(request.query_params)["path"]
+        path = f"api/git/changes/{workspace_path}"
     url = f"{agent_base}/{path}"
     params = dict(request.query_params)
+    params.pop("path", None)  # Already moved to URL path
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")}
     # Auto-inject session_api_key if not present (Changes tab etc. don't send it)

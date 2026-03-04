@@ -69,6 +69,7 @@ class StoredConversationMetadata(Base):  # type: ignore
     conversation_id = Column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
     )
+    user_id = Column(String, nullable=True, index=True)
     selected_repository = Column(String, nullable=True)
     selected_branch = Column(String, nullable=True)
     git_provider = Column(
@@ -319,8 +320,12 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         metrics = info.metrics or MetricsSnapshot()
         usage = metrics.accumulated_token_usage or TokenUsage()
 
+        # Write user_id for per-user isolation
+        user_id = await self.user_context.get_user_id()
+
         stored = StoredConversationMetadata(
             conversation_id=str(info.id),
+            user_id=user_id,
             selected_repository=info.selected_repository,
             selected_branch=info.selected_branch,
             git_provider=info.git_provider.value if info.git_provider else None,
@@ -482,6 +487,12 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         query = select(StoredConversationMetadata).where(
             StoredConversationMetadata.conversation_version == 'V1'
         )
+        # Per-user isolation: only show conversations belonging to the current user
+        user_id = await self.user_context.get_user_id()
+        if user_id:
+            query = query.where(
+                StoredConversationMetadata.user_id == user_id
+            )
         return query
 
     def _to_info(
@@ -516,7 +527,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
         return AppConversationInfo(
             id=UUID(stored.conversation_id),
-            created_by_user_id=None,  # User ID is now stored in ConversationMetadataSaas
+            created_by_user_id=stored.user_id,
             sandbox_id=stored.sandbox_id,
             selected_repository=stored.selected_repository,
             selected_branch=stored.selected_branch,
