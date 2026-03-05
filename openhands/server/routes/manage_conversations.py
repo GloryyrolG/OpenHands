@@ -636,6 +636,12 @@ async def create_share_token(
     )
     from sqlalchemy import select as sa_select
 
+    # Normalize hex (no dashes) to UUID string (with dashes) for DB lookup
+    try:
+        conversation_id = str(uuid.UUID(conversation_id))
+    except ValueError:
+        return JSONResponse(status_code=400, content={'error': 'invalid conversation id'})
+
     query = sa_select(StoredConversationMetadata).where(
         StoredConversationMetadata.conversation_id == conversation_id,
         StoredConversationMetadata.conversation_version == 'V1',
@@ -669,6 +675,12 @@ async def revoke_share_token(
         StoredConversationMetadata,
     )
     from sqlalchemy import select as sa_select
+
+    # Normalize hex (no dashes) to UUID string (with dashes) for DB lookup
+    try:
+        conversation_id = str(uuid.UUID(conversation_id))
+    except ValueError:
+        return JSONResponse(status_code=400, content={'error': 'invalid conversation id'})
 
     query = sa_select(StoredConversationMetadata).where(
         StoredConversationMetadata.conversation_id == conversation_id,
