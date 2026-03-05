@@ -217,7 +217,7 @@ export function useConversationNameContextMenu({
 
   const shareUrl = React.useMemo(() => {
     if (conversationId && conversation?.share_token) {
-      return `${window.location.origin}/conversations/${conversationId}?share=${conversation.share_token}`;
+      return `${window.location.origin}/shared/conversations/${conversationId}?share=${conversation.share_token}`;
     }
     return "";
   }, [conversationId, conversation?.share_token]);

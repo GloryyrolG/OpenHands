@@ -660,7 +660,7 @@ async def create_share_token(
 
     return JSONResponse(content={
         'share_token': stored.share_token,
-        'share_url': f'/conversations/{conversation_id}?share={stored.share_token}',
+        'share_url': f'/shared/conversations/{conversation_id}?share={stored.share_token}',
     })
 
 
@@ -697,6 +697,70 @@ async def revoke_share_token(
     await db_session.commit()
 
     return JSONResponse(content={'success': True})
+
+
+# [OH-MULTI] Shared conversation events endpoint (no auth required, share token validated)
+@app.get('/shared/conversations/{conversation_id}/events')
+async def get_shared_conversation_events(
+    request: Request,
+    conversation_id: str = Depends(validate_conversation_id),
+    db_session: AsyncSession = db_session_dependency,
+) -> JSONResponse:
+    """Get events for a shared conversation (public, requires valid share token)."""
+    from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
+        StoredConversationMetadata,
+    )
+    from openhands.app_server.config import get_default_persistence_dir
+    from openhands.sdk import Event
+    from pathlib import Path
+    from sqlalchemy import select as sa_select
+
+    share_token = request.query_params.get('share')
+    if not share_token:
+        return JSONResponse(status_code=401, content={'error': 'share token required'})
+
+    # Normalize conversation_id
+    try:
+        conversation_id = str(uuid.UUID(conversation_id))
+    except ValueError:
+        return JSONResponse(status_code=400, content={'error': 'invalid conversation id'})
+
+    # Validate share token against DB
+    result = await db_session.execute(
+        sa_select(StoredConversationMetadata).where(
+            StoredConversationMetadata.conversation_id == conversation_id,
+            StoredConversationMetadata.share_token == share_token,
+        )
+    )
+    stored = result.scalar_one_or_none()
+    if not stored:
+        return JSONResponse(status_code=404, content={'error': 'conversation not found or invalid share token'})
+
+    # Read events from filesystem
+    persistence_dir = get_default_persistence_dir()
+    conv_hex = conversation_id.replace('-', '')
+    user_id = stored.user_id
+
+    # Try with user_id prefix first, then without
+    event_dir = None
+    for candidate in [
+        persistence_dir / user_id / 'v1_conversations' / conv_hex if user_id else None,
+        persistence_dir / 'v1_conversations' / conv_hex,
+    ]:
+        if candidate and candidate.exists():
+            event_dir = candidate
+            break
+
+    items = []
+    if event_dir:
+        for path in sorted(event_dir.glob('*.json')):
+            try:
+                event = Event.model_validate_json(path.read_text())
+                items.append(event.model_dump(mode='json'))
+            except Exception:
+                pass
+
+    return JSONResponse(content={'items': items, 'next_page_id': None})
 
 
 @app.delete('/conversations/{conversation_id}', deprecated=True)

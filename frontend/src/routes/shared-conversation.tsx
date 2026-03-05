@@ -1,5 +1,5 @@
 import React from "react";
-import { Link, useParams } from "react-router";
+import { Link, useParams, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import { I18nKey } from "#/i18n/declaration";
 import { useSharedConversation } from "#/hooks/query/use-shared-conversation";
@@ -12,17 +12,19 @@ import OpenHandsLogo from "#/assets/branding/openhands-logo.svg?react";
 export default function SharedConversation() {
   const { t } = useTranslation();
   const { conversationId } = useParams<{ conversationId: string }>();
+  const [searchParams] = useSearchParams();
+  const shareToken = searchParams.get("share") || undefined;
 
   const {
     data: conversation,
     isLoading: isLoadingConversation,
     error: conversationError,
-  } = useSharedConversation(conversationId);
+  } = useSharedConversation(conversationId, shareToken);
   const {
     data: eventsData,
     isLoading: isLoadingEvents,
     error: eventsError,
-  } = useSharedConversationEvents(conversationId);
+  } = useSharedConversationEvents(conversationId, shareToken);
 
   const isLoading = isLoadingConversation || isLoadingEvents;
   const error = conversationError || eventsError;

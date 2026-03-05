@@ -25,33 +25,34 @@ export interface EventPage {
 
 export const sharedConversationService = {
   /**
-   * Get a single shared conversation by ID
+   * Get a single shared conversation by ID (uses existing conversation API with share token)
    */
   async getSharedConversation(
     conversationId: string,
+    shareToken?: string,
   ): Promise<SharedConversation | null> {
-    const response = await openHands.get<(SharedConversation | null)[]>(
-      "/api/shared-conversations",
-      { params: { ids: conversationId } },
+    const response = await openHands.get<SharedConversation>(
+      `/api/conversations/${conversationId}`,
+      { params: shareToken ? { share: shareToken } : {} },
     );
-    return response.data[0] || null;
+    return response.data || null;
   },
 
   /**
-   * Get events for a shared conversation
+   * Get events for a shared conversation (uses dedicated shared events endpoint)
    */
   async getSharedConversationEvents(
     conversationId: string,
     limit: number = 100,
     pageId?: string,
+    shareToken?: string,
   ): Promise<EventPage> {
     const response = await openHands.get<EventPage>(
-      "/api/shared-events/search",
+      `/api/shared/conversations/${conversationId}/events`,
       {
         params: {
-          conversation_id: conversationId,
-          limit,
           ...(pageId && { page_id: pageId }),
+          ...(shareToken && { share: shareToken }),
         },
       },
     );
