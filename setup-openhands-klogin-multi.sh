@@ -157,6 +157,7 @@ sudo docker run -d \
     -e OPENHANDS_DEFAULT_LLM_API_KEY="\${CURRENT_APIKEY:-}" \
     -e OPENHANDS_DEFAULT_LLM_BASE_URL="\${CURRENT_BASE_URL:-}" \
     -e ENABLE_MCP=false \
+    -e OH_PERSISTENCE_DIR=/.openhands \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v ~/.openhands-multi:/.openhands \
     openhands-multi:latest

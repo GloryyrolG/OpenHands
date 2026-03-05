@@ -555,6 +555,45 @@ async def get_conversation(
                         conv_info.share_token = st_row
                 except Exception:
                     pass
+                # [OH-MULTI] Opportunistic event sync: if sandbox is up but
+                # filesystem has no events yet, sync in background
+                if (
+                    app_conversation.conversation_url
+                    and app_conversation.session_api_key
+                ):
+                    try:
+                        from pathlib import Path
+
+                        from openhands.app_server.config import (
+                            get_default_persistence_dir,
+                        )
+
+                        _pd = get_default_persistence_dir()
+                        _uid = getattr(app_conversation, 'created_by_user_id', None)
+                        _ed = _pd
+                        if _uid:
+                            _ed = _ed / _uid
+                        _ed = _ed / 'v1_conversations' / conversation_id.replace('-', '')
+                        if not _ed.exists() or not any(_ed.glob('*.json')):
+                            # Background task needs its own httpx client since
+                            # the request-scoped one gets closed after response
+                            _conv_url = app_conversation.conversation_url
+                            _api_key = app_conversation.session_api_key
+
+                            async def _bg_sync():
+                                async with httpx.AsyncClient(timeout=30) as client:
+                                    await _sync_events_from_sandbox(
+                                        conversation_id,
+                                        _conv_url,
+                                        _api_key,
+                                        _uid,
+                                        client,
+                                    )
+
+                            asyncio.create_task(_bg_sync())
+                    except Exception:
+                        pass
+
                 # [OH-MULTI] Strip sensitive fields for shared (non-owner) views
                 if share_token:
                     conv_info.session_api_key = None
@@ -687,6 +726,81 @@ async def delete_conversation(
     return await _delete_v0_conversation(conversation_id, user_id)
 
 
+# [OH-MULTI] Event sync: persist V1 events from sandbox to app-server filesystem
+async def _sync_events_from_sandbox(
+    conversation_id: str,
+    conversation_url: str,
+    session_api_key: str,
+    user_id: str | None,
+    httpx_client: httpx.AsyncClient,
+):
+    """Fetch events from sandbox agent-server and save to filesystem.
+
+    This ensures events survive sandbox deletion/expiry. The FilesystemEventService
+    reads from the same directory structure we write to.
+    """
+    from pathlib import Path
+
+    from openhands.app_server.config import get_default_persistence_dir
+    from openhands.sdk import Event
+
+    persistence_dir = get_default_persistence_dir()
+    conv_hex = conversation_id.replace('-', '')
+
+    # Match EventServiceBase.get_conversation_path layout
+    event_dir = persistence_dir
+    if user_id:
+        event_dir = event_dir / user_id
+    event_dir = event_dir / 'v1_conversations' / conv_hex
+    event_dir.mkdir(parents=True, exist_ok=True)
+
+    synced = 0
+    page_id = None
+    while True:
+        params: dict[str, str | int] = {'limit': 100}
+        if page_id:
+            params['page_id'] = page_id
+        try:
+            resp = await httpx_client.get(
+                f'{conversation_url}/events/search',
+                params=params,
+                headers={'X-Session-API-Key': session_api_key},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f'Event sync: sandbox returned {resp.status_code} for {conv_hex}'
+                )
+                break
+            data = resp.json()
+        except Exception:
+            logger.warning(f'Event sync: request failed for {conv_hex}', exc_info=True)
+            break
+
+        items = data.get('items', [])
+        for item in items:
+            try:
+                event = Event.model_validate(item)
+                event_id = event.id
+                if isinstance(event_id, str):
+                    id_hex = event_id.replace('-', '')
+                else:
+                    id_hex = event_id.hex
+                path = event_dir / f'{id_hex}.json'
+                if not path.exists():  # idempotent
+                    path.write_text(event.model_dump_json(indent=2))
+                    synced += 1
+            except Exception:
+                logger.warning(f'Event sync: failed to save event', exc_info=True)
+
+        page_id = data.get('next_page_id')
+        if not page_id or not items:
+            break
+
+    if synced > 0:
+        logger.info(f'Event sync: saved {synced} events for conversation {conv_hex}')
+
+
 async def _try_delete_v1_conversation(
     conversation_id: str,
     app_conversation_service: AppConversationService,
@@ -706,6 +820,29 @@ async def _try_delete_v1_conversation(
             )
         )
         if app_conversation_info:
+            # [OH-MULTI] Sync events from sandbox before deletion
+            try:
+                app_conversation = await app_conversation_service.get_app_conversation(
+                    conversation_uuid
+                )
+                if (
+                    app_conversation
+                    and app_conversation.conversation_url
+                    and app_conversation.session_api_key
+                ):
+                    await _sync_events_from_sandbox(
+                        conversation_id,
+                        app_conversation.conversation_url,
+                        app_conversation.session_api_key,
+                        app_conversation_info.created_by_user_id,
+                        httpx_client,
+                    )
+            except Exception:
+                logger.warning(
+                    f'Event sync before delete failed for {conversation_id}',
+                    exc_info=True,
+                )
+
             # This is a V1 conversation, delete it using the app conversation service
             # Pass the conversation ID for secure deletion
             result = await app_conversation_service.delete_app_conversation(
