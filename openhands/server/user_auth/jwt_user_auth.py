@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 from fastapi import Request, HTTPException, status
@@ -79,15 +80,28 @@ class JWTUserAuth(UserAuth):
         return settings_store
 
     async def get_user_settings(self) -> Settings | None:
-        # 每次都重新读取，不缓存
+        # Re-read every time, no caching
         settings_store = await self.get_user_settings_store()
         settings = await settings_store.load()
 
         # Merge config.toml settings with stored settings
         if settings:
             settings = settings.merge_with_config_settings()
+            return settings
 
-        return settings
+        # No settings file found — return defaults from env vars so the
+        # frontend doesn't show "Settings not found" for new users
+        default_model = os.environ.get("OPENHANDS_DEFAULT_LLM_MODEL", "")
+        default_base = os.environ.get("OPENHANDS_DEFAULT_LLM_BASE_URL", "")
+        default_key = os.environ.get("OPENHANDS_DEFAULT_LLM_API_KEY", "")
+        if default_model:
+            return Settings(
+                llm_model=default_model,
+                llm_base_url=default_base or None,
+                llm_api_key=SecretStr(default_key) if default_key else None,
+            )
+
+        return None
 
     async def get_secrets_store(self) -> SecretsStore:
         secrets_store = self._secrets_store
