@@ -33,7 +33,10 @@ import { useConfig } from "#/hooks/query/use-config";
 import { validateFiles } from "#/utils/file-validation";
 import { useConversationStore } from "#/stores/conversation-store";
 import ConfirmationModeEnabled from "./confirmation-mode-enabled";
-import { useActiveConversation } from "#/hooks/query/use-active-conversation";
+import {
+  useActiveConversation,
+  useShareToken,
+} from "#/hooks/query/use-active-conversation";
 import { useTaskPolling } from "#/hooks/query/use-task-polling";
 import { useConversationWebSocket } from "#/contexts/conversation-websocket-context";
 import ChatStatusIndicator from "./chat-status-indicator";
@@ -50,6 +53,8 @@ function getEntryPoint(
 
 export function ChatInterface() {
   const posthog = usePostHog();
+  const shareToken = useShareToken();
+  const isSharedView = !!shareToken;
   const { setMessageToSend } = useConversationStore();
   const { data: conversation } = useActiveConversation();
   const { errorMessage, removeErrorMessage } = useErrorMessageStore();
@@ -325,14 +330,20 @@ export function ChatInterface() {
             {!hitBottom && <ScrollToBottomButton onClick={scrollDomToBottom} />}
           </div>
 
-          {errorMessage && (
+          {errorMessage && !isSharedView && (
             <ErrorMessageBanner
               message={errorMessage}
               onDismiss={removeErrorMessage}
             />
           )}
 
-          <InteractiveChatBox onSubmit={handleSendMessage} />
+          {isSharedView ? (
+            <div className="text-center text-sm text-gray-400 py-3 border-t border-gray-700">
+              Shared View (read-only)
+            </div>
+          ) : (
+            <InteractiveChatBox onSubmit={handleSendMessage} />
+          )}
         </div>
 
         {config?.app_mode !== "saas" && !isV1Conversation && (

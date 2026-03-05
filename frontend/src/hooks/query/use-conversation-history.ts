@@ -1,9 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router";
 import EventService from "#/api/event-service/event-service.api";
 import { useUserConversation } from "#/hooks/query/use-user-conversation";
 
 export const useConversationHistory = (conversationId?: string) => {
-  const { data: conversation } = useUserConversation(conversationId ?? null);
+  const [searchParams] = useSearchParams();
+  const shareToken = searchParams.get("share");
+  const { data: conversation } = useUserConversation(
+    conversationId ?? null,
+    undefined,
+    shareToken,
+  );
   const conversationVersion = conversation?.conversation_version;
 
   return useQuery({

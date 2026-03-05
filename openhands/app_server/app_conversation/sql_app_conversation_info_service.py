@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import AsyncGenerator
 from uuid import UUID
@@ -101,6 +101,7 @@ class StoredConversationMetadata(Base):  # type: ignore
     sandbox_id = Column(String, nullable=True, index=True)
     parent_conversation_id = Column(String, nullable=True, index=True)
     public = Column(Boolean, nullable=True, index=True)
+    share_token = Column(String, nullable=True, unique=True, index=True)
 
 
 @dataclass
@@ -112,6 +113,9 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
     db_session: AsyncSession
     user_context: UserContext
+    # [OH-MULTI] Share token bypass: set before calling get_app_conversation_info
+    # to bypass user_id filtering for shared conversations
+    _bypass_share_token: str | None = field(default=None, init=False, repr=False)
 
     async def search_app_conversation_info(
         self,
@@ -355,6 +359,13 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             public=info.public,
         )
 
+        # Preserve existing share_token: merge() would overwrite it with None
+        existing = await self.db_session.get(
+            StoredConversationMetadata, str(info.id)
+        )
+        if existing and existing.share_token:
+            stored.share_token = existing.share_token
+
         await self.db_session.merge(stored)
         await self.db_session.commit()
         return info
@@ -487,12 +498,18 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         query = select(StoredConversationMetadata).where(
             StoredConversationMetadata.conversation_version == 'V1'
         )
-        # Per-user isolation: only show conversations belonging to the current user
-        user_id = await self.user_context.get_user_id()
-        if user_id:
+        # [OH-MULTI] If share_token bypass is set, filter by share_token instead of user_id
+        if self._bypass_share_token:
             query = query.where(
-                StoredConversationMetadata.user_id == user_id
+                StoredConversationMetadata.share_token == self._bypass_share_token
             )
+        else:
+            # Per-user isolation: only show conversations belonging to the current user
+            user_id = await self.user_context.get_user_id()
+            if user_id:
+                query = query.where(
+                    StoredConversationMetadata.user_id == user_id
+                )
         return query
 
     def _to_info(

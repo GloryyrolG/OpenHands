@@ -12,7 +12,10 @@ import { useBatchFeedback } from "#/hooks/query/use-batch-feedback";
 import { EventHandler } from "../wrapper/event-handler";
 import { useConversationConfig } from "#/hooks/query/use-conversation-config";
 
-import { useActiveConversation } from "#/hooks/query/use-active-conversation";
+import {
+  useActiveConversation,
+  useShareToken,
+} from "#/hooks/query/use-active-conversation";
 import { useTaskPolling } from "#/hooks/query/use-task-polling";
 
 import { displayErrorToast } from "#/utils/custom-toast-handlers";
@@ -91,6 +94,10 @@ function AppContent() {
     }
   }, [isTask, taskStatus, taskDetail, t]);
 
+  // [OH-MULTI] Shared view: skip auto-start
+  const shareToken = useShareToken();
+  const isSharedView = !!shareToken;
+
   // 3. Auto-start Effect - handles conversation not found and auto-starting STOPPED conversations
   React.useEffect(() => {
     // Wait for data to be fetched
@@ -98,8 +105,10 @@ function AppContent() {
 
     // Handle conversation not found
     if (!conversation) {
-      displayErrorToast(t(I18nKey.CONVERSATION$NOT_EXIST_OR_NO_PERMISSION));
-      navigate("/");
+      if (!isSharedView) {
+        displayErrorToast(t(I18nKey.CONVERSATION$NOT_EXIST_OR_NO_PERMISSION));
+        navigate("/");
+      }
       return;
     }
 
@@ -114,8 +123,8 @@ function AppContent() {
     // Mark as processed immediately to prevent duplicate calls
     processedConversationId.current = currentConversationId;
 
-    // Auto-start STOPPED conversations on initial load only
-    if (currentStatus === "STOPPED" && !isStarting) {
+    // Auto-start STOPPED conversations on initial load only (skip for shared views)
+    if (currentStatus === "STOPPED" && !isStarting && !isSharedView) {
       startConversation(
         { conversationId: currentConversationId, providers },
         {
@@ -138,6 +147,7 @@ function AppContent() {
     isFetched,
     isAuthed,
     isStarting,
+    isSharedView,
     providers,
     startConversation,
     navigate,

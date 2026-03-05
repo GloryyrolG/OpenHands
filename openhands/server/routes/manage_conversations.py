@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
@@ -470,16 +471,27 @@ async def search_conversations(
 
 @app.get('/conversations/{conversation_id}', deprecated=True)
 async def get_conversation(
+    request: Request,
     conversation_id: str = Depends(validate_conversation_id),
     conversation_store: ConversationStore = Depends(get_conversation_store),
     app_conversation_service: AppConversationService = app_conversation_service_dependency,
     httpx_client: httpx.AsyncClient = httpx_client_dependency,
+    db_session: AsyncSession = db_session_dependency,
 ) -> ConversationInfo | None:
     """Get a single conversation by ID.
 
     Use the V1 endpoint ``GET /api/v1/app-conversations?ids={conversation_id}`` instead,
     which supports batch retrieval of conversations by their IDs.
     """
+    # [OH-MULTI] Share token: bypass user_id filtering if valid share token provided
+    share_token = request.query_params.get('share')
+    _info_svc = None
+    if share_token:
+        # Set share_token bypass on the underlying info service
+        _info_svc = getattr(app_conversation_service, 'app_conversation_info_service', None)
+        if _info_svc:
+            _info_svc._bypass_share_token = share_token
+
     try:
         # Shim to add V1 conversations
         try:
@@ -526,7 +538,28 @@ async def get_conversation(
                         )
                         app_conversation.sandbox_status = SandboxStatus.STARTING
 
-                return _to_conversation_info(app_conversation)
+                conv_info = _to_conversation_info(app_conversation)
+                # [OH-MULTI] Include share_token in response
+                try:
+                    from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
+                        StoredConversationMetadata,
+                    )
+                    from sqlalchemy import select as sa_select
+
+                    st_query = sa_select(StoredConversationMetadata.share_token).where(
+                        StoredConversationMetadata.conversation_id == conversation_id,
+                    )
+                    st_result = await db_session.execute(st_query)
+                    st_row = st_result.scalar_one_or_none()
+                    if st_row:
+                        conv_info.share_token = st_row
+                except Exception:
+                    pass
+                # [OH-MULTI] Strip sensitive fields for shared (non-owner) views
+                if share_token:
+                    conv_info.session_api_key = None
+                    conv_info.url = None
+                return conv_info
         except (ValueError, TypeError, Exception):
             # Not a V1 conversation or service error
             pass
@@ -545,6 +578,74 @@ async def get_conversation(
         return conversation_info
     except FileNotFoundError:
         return None
+    finally:
+        # [OH-MULTI] Always reset bypass to avoid leaking across requests
+        if _info_svc:
+            _info_svc._bypass_share_token = None
+
+
+# [OH-MULTI] Share token management endpoints
+@app.post('/conversations/{conversation_id}/share')
+async def create_share_token(
+    conversation_id: str = Depends(validate_conversation_id),
+    user_id: str | None = Depends(get_user_id),
+    db_session: AsyncSession = db_session_dependency,
+) -> JSONResponse:
+    """Generate a share token for a conversation (owner only)."""
+    from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
+        StoredConversationMetadata,
+    )
+    from sqlalchemy import select as sa_select
+
+    query = sa_select(StoredConversationMetadata).where(
+        StoredConversationMetadata.conversation_id == conversation_id,
+        StoredConversationMetadata.conversation_version == 'V1',
+    )
+    if user_id:
+        query = query.where(StoredConversationMetadata.user_id == user_id)
+    result = await db_session.execute(query)
+    stored = result.scalar_one_or_none()
+    if not stored:
+        return JSONResponse(status_code=404, content={'error': 'conversation not found'})
+
+    # Generate URL-safe token (128-bit entropy) if not already shared
+    if not stored.share_token:
+        stored.share_token = secrets.token_urlsafe(16)
+        await db_session.commit()
+
+    return JSONResponse(content={
+        'share_token': stored.share_token,
+        'share_url': f'/conversations/{conversation_id}?share={stored.share_token}',
+    })
+
+
+@app.delete('/conversations/{conversation_id}/share')
+async def revoke_share_token(
+    conversation_id: str = Depends(validate_conversation_id),
+    user_id: str | None = Depends(get_user_id),
+    db_session: AsyncSession = db_session_dependency,
+) -> JSONResponse:
+    """Revoke a share token for a conversation (owner only)."""
+    from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
+        StoredConversationMetadata,
+    )
+    from sqlalchemy import select as sa_select
+
+    query = sa_select(StoredConversationMetadata).where(
+        StoredConversationMetadata.conversation_id == conversation_id,
+        StoredConversationMetadata.conversation_version == 'V1',
+    )
+    if user_id:
+        query = query.where(StoredConversationMetadata.user_id == user_id)
+    result = await db_session.execute(query)
+    stored = result.scalar_one_or_none()
+    if not stored:
+        return JSONResponse(status_code=404, content={'error': 'conversation not found'})
+
+    stored.share_token = None
+    await db_session.commit()
+
+    return JSONResponse(content={'success': True})
 
 
 @app.delete('/conversations/{conversation_id}', deprecated=True)

@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 import React from "react";
 import { usePostHog } from "posthog-js/react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useParams, useNavigate } from "react-router";
 import { transformVSCodeUrl } from "#/utils/vscode-url-helper";
 import useMetricsStore from "#/stores/metrics-store";
@@ -9,7 +10,7 @@ import ConversationService from "#/api/conversation-service/conversation-service
 import { useDeleteConversation } from "./mutation/use-delete-conversation";
 import { useUnifiedPauseConversationSandbox } from "./mutation/use-unified-stop-conversation";
 import { useGetTrajectory } from "./mutation/use-get-trajectory";
-import { useUpdateConversationPublicFlag } from "./mutation/use-update-conversation-public-flag";
+// useUpdateConversationPublicFlag removed — share uses token-based API instead
 import { downloadTrajectory } from "#/utils/download-trajectory";
 import {
   displayErrorToast,
@@ -39,6 +40,7 @@ export function useConversationNameContextMenu({
   onContextMenuToggle,
 }: UseConversationNameContextMenuProps) {
   const posthog = usePostHog();
+  const queryClient = useQueryClient();
   const { t } = useTranslation();
   const { conversationId: currentConversationId } = useParams();
   const navigate = useNavigate();
@@ -46,7 +48,6 @@ export function useConversationNameContextMenu({
   const { mutate: deleteConversation } = useDeleteConversation();
   const { mutate: stopConversation } = useUnifiedPauseConversationSandbox();
   const { mutate: getTrajectory } = useGetTrajectory();
-  const { mutate: updatePublicFlag } = useUpdateConversationPublicFlag();
   const { data: conversation } = useActiveConversation();
   const metrics = useMetricsStore();
 
@@ -187,27 +188,39 @@ export function useConversationNameContextMenu({
     onContextMenuToggle?.(false);
   };
 
-  const handleTogglePublic = (event: React.MouseEvent<HTMLButtonElement>) => {
+  const handleTogglePublic = async (
+    event: React.MouseEvent<HTMLButtonElement>,
+  ) => {
     event.preventDefault();
     event.stopPropagation();
 
-    if (conversationId && conversation) {
-      // Toggle the current public state
-      const newPublicState = !conversation.public;
-      updatePublicFlag({
-        conversationId,
-        isPublic: newPublicState,
-      });
+    if (!conversationId) return;
+
+    try {
+      if (conversation?.share_token) {
+        // Revoke share
+        await ConversationService.revokeShareToken(conversationId);
+        displaySuccessToast("Share link revoked");
+      } else {
+        // Create share
+        const result = await ConversationService.createShareToken(conversationId);
+        const url = `${window.location.origin}${result.share_url}`;
+        navigator.clipboard.writeText(url);
+        displaySuccessToast(t(I18nKey.CONVERSATION$LINK_COPIED));
+      }
+      // Refresh conversation to get updated share_token
+      queryClient.invalidateQueries({ queryKey: ["user", "conversation"] });
+    } catch {
+      displayErrorToast("Failed to update share status");
     }
-    // Don't close menu - let user see the toggle state change
   };
 
   const shareUrl = React.useMemo(() => {
-    if (conversationId) {
-      return `${window.location.origin}/shared/conversations/${conversationId}`;
+    if (conversationId && conversation?.share_token) {
+      return `${window.location.origin}/conversations/${conversationId}?share=${conversation.share_token}`;
     }
     return "";
-  }, [conversationId]);
+  }, [conversationId, conversation?.share_token]);
 
   const handleCopyShareLink = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();

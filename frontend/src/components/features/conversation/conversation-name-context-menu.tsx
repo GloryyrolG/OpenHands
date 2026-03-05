@@ -70,10 +70,8 @@ export function ConversationNameContextMenu({
   // This is a temporary measure and may be re-enabled in the future
   const isV1Conversation = conversation?.conversation_version === "V1";
 
-  // Check if we should show the public sharing option
-  // Only show for V1 conversations in SAAS mode
-  const shouldShowPublicSharing =
-    isV1Conversation && config?.app_mode === "saas" && onTogglePublic;
+  // Show sharing option for all V1 conversations
+  const shouldShowPublicSharing = isV1Conversation && onTogglePublic;
 
   const hasDownload = Boolean(onDownloadViaVSCode || onDownloadConversation);
   const hasExport = Boolean(onExportConversation);
@@ -205,12 +203,13 @@ export function ConversationNameContextMenu({
             <div className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={conversation?.public || false}
+                checked={!!conversation?.share_token}
+                readOnly
                 className="w-4 h-4 ml-2 cursor-pointer"
               />
               <span>{t(I18nKey.CONVERSATION$SHARE_PUBLICLY)}</span>
             </div>
-            {conversation?.public && shareUrl && onCopyShareLink && (
+            {conversation?.share_token && shareUrl && onCopyShareLink && (
               <div className="flex items-center gap-1">
                 <button
                   type="button"

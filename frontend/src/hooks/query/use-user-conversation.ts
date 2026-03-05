@@ -19,15 +19,19 @@ type RefetchInterval = (
 export const useUserConversation = (
   cid: string | null,
   refetchInterval?: RefetchInterval,
+  shareToken?: string | null,
 ) =>
   useQuery({
-    queryKey: ["user", "conversation", cid],
+    queryKey: ["user", "conversation", cid, shareToken],
     queryFn: async () => {
       if (!cid) return null;
 
       // Use the legacy GET endpoint - it handles both V0 and V1 conversations
       // V1 conversations are automatically detected by UUID format and converted
-      const conversation = await ConversationService.getConversation(cid);
+      const conversation = await ConversationService.getConversation(
+        cid,
+        shareToken,
+      );
       return conversation;
     },
     enabled: !!cid,

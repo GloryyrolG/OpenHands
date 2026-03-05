@@ -266,9 +266,12 @@ class ConversationService {
 
   static async getConversation(
     conversationId: string,
+    shareToken?: string | null,
   ): Promise<Conversation | null> {
+    const params = shareToken ? { share: shareToken } : {};
     const { data } = await openHands.get<Conversation | null>(
       `/api/conversations/${conversationId}`,
+      { params },
     );
 
     return data;
@@ -332,6 +335,20 @@ class ConversationService {
     });
 
     return data.prompt;
+  }
+
+  static async createShareToken(
+    conversationId: string,
+  ): Promise<{ share_token: string; share_url: string }> {
+    const { data } = await openHands.post<{
+      share_token: string;
+      share_url: string;
+    }>(`/api/conversations/${conversationId}/share`);
+    return data;
+  }
+
+  static async revokeShareToken(conversationId: string): Promise<void> {
+    await openHands.delete(`/api/conversations/${conversationId}/share`);
   }
 
   static async updateConversation(
