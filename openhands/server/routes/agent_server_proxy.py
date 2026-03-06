@@ -11,8 +11,12 @@ from starlette.responses import StreamingResponse
 
 agent_proxy_router = APIRouter(prefix="/agent-server-proxy")
 
-# Per-session isolation: SQLite DB at ~/.openhands/openhands.db (app writes to home dir)
-_DB_PATH = '/root/.openhands/openhands.db'
+# Per-session isolation: SQLite DB path — respect OH_PERSISTENCE_DIR / FILE_STORE_PATH
+import os as _os_mod
+_DB_PATH = _os_mod.path.join(
+    _os_mod.environ.get('OH_PERSISTENCE_DIR') or _os_mod.environ.get('FILE_STORE_PATH') or '/root/.openhands',
+    'openhands.db'
+)
 
 # Per-conversation URL cache: conversation_id -> (agent_server_url, timestamp)
 _url_cache: dict = {}
