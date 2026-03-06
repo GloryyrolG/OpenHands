@@ -500,44 +500,10 @@ async def get_conversation(
                 conversation_uuid
             )
             if app_conversation:
-                if (
-                    app_conversation.sandbox_status == SandboxStatus.RUNNING
-                    and app_conversation.execution_status is None
-                ):
-                    # The sandbox is running, but we were unable to determine a status for
-                    # the conversation. It may be that it is still starting, or that the
-                    # conversation has been stopped / deleted.
-                    try:
-                        # Check the server info is available
-                        conversation_url = urlparse(app_conversation.conversation_url)
-                        sandbox_info_url = f'{str(conversation_url.scheme)}://{str(conversation_url.netloc)}/server_info'
-                        response = await httpx_client.get(sandbox_info_url)
-                        response.raise_for_status()
-                        server_info = response.json()
-
-                        # If the server has not been running long, we consider it still starting
-                        uptime = int(server_info.get('uptime'))
-                        if uptime < _RESUME_GRACE_PERIOD:
-                            app_conversation.sandbox_status = SandboxStatus.STARTING
-
-                    except Exception:
-                        # The sandbox is marked as RUNNING, but the server is not responding.
-                        # There is a bug in runtime API which means that the server is marked
-                        # as RUNNING before it is actually started. (Primarily affecting resumed
-                        # runtimes) As a temporary work around for this, we mark the server as
-                        # STARTING. If the sandbox is actually in an error state, the API will
-                        # discover this quite quickly and mark the sandbox as ERROR
-                        logger.warning(
-                            'get_sandbox_info_failed',
-                            extra={
-                                'conversation_id': app_conversation.id,
-                                'sandbox_id': app_conversation.sandbox_id,
-                            },
-                            exc_info=True,
-                            stack_info=True,
-                        )
-                        app_conversation.sandbox_status = SandboxStatus.STARTING
-
+                # V1: skip /server_info check — V1 agent-server has its own
+                # execution_status mechanism. When execution_status is None the
+                # agent is still initializing; _to_conversation_info maps it
+                # to RuntimeStatus.STARTING.
                 conv_info = _to_conversation_info(app_conversation)
                 # [OH-MULTI] Include share_token in response
                 try:
@@ -612,9 +578,12 @@ async def get_conversation(
                     except Exception:
                         pass
                 return conv_info
-        except (ValueError, TypeError, Exception):
-            # Not a V1 conversation or service error
-            pass
+        except (ValueError, TypeError) as e:
+            # Not a V1 conversation, normal fallback to V0
+            logger.debug(f'Not a V1 conversation {conversation_id}: {e}')
+        except Exception as e:
+            # V1 path had a real error — log full traceback for diagnosis
+            logger.error(f'get_conversation V1 unexpected error for {conversation_id}: {type(e).__name__}: {e}', exc_info=True)
 
         metadata = await conversation_store.get_metadata(conversation_id)
         num_connections = len(
@@ -1815,9 +1784,13 @@ def _to_conversation_info(app_conversation: AppConversation) -> ConversationInfo
             ConversationExecutionStatus.FINISHED: RuntimeStatus.READY,
             ConversationExecutionStatus.STUCK: RuntimeStatus.ERROR,
         }
-        runtime_status = runtime_status_mapping.get(
-            app_conversation.execution_status, RuntimeStatus.ERROR
-        )
+        if app_conversation.execution_status is None:
+            # V1: sandbox running but agent still initializing
+            runtime_status = RuntimeStatus.STARTING_RUNTIME
+        else:
+            runtime_status = runtime_status_mapping.get(
+                app_conversation.execution_status, RuntimeStatus.ERROR
+            )
     else:
         runtime_status = None
 

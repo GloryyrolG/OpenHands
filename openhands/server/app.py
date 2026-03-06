@@ -121,11 +121,11 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
     [OH-MULTI-PERSESSION] Per-conversation routing via _gtau(conversation_id)."""
     import websockets as _ws
     from starlette.responses import StreamingResponse as _SR
-    from openhands.server.routes.agent_server_proxy import _get_agent_server_key as _gask
+    from openhands.server.routes.agent_server_proxy import _get_tab_agent_key as _gtak, _get_agent_server_key as _gask
     params = dict(request.query_params)
-    # [OH-MULTI] inject session_api_key if missing
+    # [OH-MULTI] inject session_api_key if missing — use per-conversation key
     if 'session_api_key' not in params:
-        _srv_key = _gask()
+        _srv_key = _gtak(conversation_id) or _gask()
         if _srv_key:
             params['session_api_key'] = _srv_key
     qs = '&'.join(f'{k}={v}' for k, v in params.items())
@@ -160,11 +160,18 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
                             yield f'data: {data}\n\n'
                         except _asyncio.TimeoutError:
                             yield ':heartbeat\n\n'
-                        except Exception:
+                        except Exception as _inner_exc:
+                            import logging as _lg
+                            _lg.getLogger('openhands').warning(
+                                f'SSE proxy WS recv error for {conversation_id}: {type(_inner_exc).__name__}: {_inner_exc}'
+                            )
                             break
                     # WS closed — don't end SSE, reconnect after brief wait
-            except Exception:
-                pass
+            except Exception as _exc:
+                import logging as _lg
+                _lg.getLogger('openhands').warning(
+                    f'SSE proxy WS connect failed for {conversation_id}: {type(_exc).__name__}: {_exc}'
+                )
             fail_count += 1
             yield ':heartbeat\n\n'
             await _asyncio.sleep(3)
