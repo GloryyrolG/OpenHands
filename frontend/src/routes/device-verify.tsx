@@ -182,7 +182,7 @@ export default function DeviceVerify() {
             </div>
           </div>
           <p className="text-muted-foreground mb-6 text-center">
-            Do you want to authorize this device to access your OpenHands
+            Do you want to authorize this device to access your CDA
             account?
           </p>
           <div className="flex gap-3">

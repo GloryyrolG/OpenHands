@@ -1,10 +1,13 @@
 import React from "react";
 import { useNavigate, useSearchParams } from "react-router";
+import { useTranslation } from "react-i18next";
 import { useConfig } from "#/hooks/query/use-config";
 import { EmailAuthForm } from "#/components/features/auth/email-auth-form";
 import { useAuth } from "#/hooks/use-auth";
+import { I18nKey } from "#/i18n/declaration";
 
 export default function LoginPage() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const returnTo = searchParams.get("returnTo") || "/";
@@ -36,7 +39,8 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-900 p-4">
       <div className="text-center mb-8">
-        <h1 className="text-3xl font-bold text-white mb-2">OpenHands</h1>
+        <h1 className="text-3xl font-bold text-white mb-2">{t(I18nKey.BRANDING$OPENHANDS)}</h1>
+        {/* eslint-disable-next-line i18next/no-literal-string */}
         <p className="text-gray-400">Sign in to continue</p>
       </div>
       <EmailAuthForm />
