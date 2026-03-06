@@ -146,8 +146,11 @@ def _get_tab_agent_key(conversation_id: str) -> str:
                 key = e.split("=", 1)[1]
                 _key_cache[cid] = (key, _t.time())
                 return key
-    except Exception:
-        pass
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger('openhands').warning(
+            f'_get_tab_agent_key failed for {conversation_id}: {type(e).__name__}: {e}'
+        )
     return _get_agent_server_key()
 
 
@@ -175,6 +178,7 @@ def _get_oh_tab_container_for_port(host_port: int) -> dict:
 def _resolve_tab_agent_url(conversation_id: str) -> str:
     """Per-session routing: look up agent_server_url for this conversation from SQLite DB.
     Returns the agent server base URL (e.g. http://127.0.0.1:14001) or empty string."""
+    import logging as _lg
     clean = conversation_id.removeprefix('task-').replace('-', '')
     try:
         conn = _sqlite3.connect(_DB_PATH, timeout=3)
@@ -189,8 +193,10 @@ def _resolve_tab_agent_url(conversation_id: str) -> str:
         conn.close()
         if row and row[0]:
             return row[0]
-    except Exception:
-        pass
+    except Exception as e:
+        _lg.getLogger('openhands').warning(
+            f'_resolve_tab_agent_url failed for {conversation_id}: {type(e).__name__}: {e}'
+        )
     return ''
 
 
@@ -208,7 +214,11 @@ def _get_tab_agent_url(conversation_id: str) -> str:
         _url_cache[cid] = (url, _t.time())
         return url
     # Fallback: use first oh-multi- container's published port
+    import logging as _lg
     fallback = f"http://127.0.0.1:{_get_agent_server_port()}"
+    _lg.getLogger('openhands').warning(
+        f'_get_tab_agent_url: no URL found for {conversation_id}, falling back to {fallback}'
+    )
     return fallback
 
 
