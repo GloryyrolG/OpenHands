@@ -173,12 +173,16 @@ export default function MainApp() {
     setLoginMethodExists(checkLoginMethodExists());
   }, [isAuthed, checkLoginMethodExists]);
 
+  // [OH-MULTI] Skip login redirect when share token is present
+  const hasShareToken = searchParams.has("share");
+
   const shouldRedirectToLogin =
     config.isLoading ||
     isAuthLoading ||
     (!isAuthed &&
       !isAuthError &&
       !isOnIntermediatePage &&
+      !hasShareToken &&
       config.data?.app_mode === "saas" &&
       !loginMethodExists);
 
@@ -210,6 +214,7 @@ export default function MainApp() {
     !isAuthError &&
     !isFetchingAuth &&
     !isOnIntermediatePage &&
+    !hasShareToken &&
     config.data?.app_mode === "saas" &&
     loginMethodExists;
 
@@ -222,7 +227,7 @@ export default function MainApp() {
       )}
     >
       <title>{appTitle}</title>
-      <ChatSidebar />
+      {!hasShareToken && <ChatSidebar />}
 
       <div className="flex flex-col flex-1 h-full overflow-hidden">
         {config.data &&

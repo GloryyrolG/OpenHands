@@ -660,7 +660,7 @@ async def create_share_token(
 
     return JSONResponse(content={
         'share_token': stored.share_token,
-        'share_url': f'/shared/conversations/{conversation_id}?share={stored.share_token}',
+        'share_url': f'/conversations/{conversation_id}?share={stored.share_token}',
     })
 
 
@@ -799,7 +799,28 @@ async def get_shared_conversation_events(
         except Exception:
             logger.warning('Shared events: real-time sync failed', exc_info=True)
 
-    return JSONResponse(content={'items': items, 'next_page_id': None})
+    # Try to find app preview URL from sandbox port mappings
+    app_url = None
+    try:
+        sandbox_id = stored.sandbox_id if hasattr(stored, 'sandbox_id') else None
+        if sandbox_id:
+            import docker as _docker
+            _dc = _docker.from_env()
+            _ctr = _dc.containers.get(sandbox_id)
+            if _ctr.status == 'running':
+                _ports = _ctr.attrs.get('NetworkSettings', {}).get('Ports', {})
+                # Check common app ports: 8011 (default worker), then user app ports
+                for _check_port in ['8011/tcp']:
+                    _bindings = _ports.get(_check_port, [])
+                    if _bindings:
+                        _host_port = _bindings[0].get('HostPort', '')
+                        if _host_port:
+                            app_url = f'/api/sandbox-port/{_host_port}/'
+                            break
+    except Exception:
+        pass
+
+    return JSONResponse(content={'items': items, 'next_page_id': None, 'app_url': app_url})
 
 
 @app.delete('/conversations/{conversation_id}', deprecated=True)
