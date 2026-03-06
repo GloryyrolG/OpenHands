@@ -598,6 +598,19 @@ async def get_conversation(
                 if share_token:
                     conv_info.session_api_key = None
                     conv_info.url = None
+                    # Inject app_url: lookup sandbox container's 8011 Docker NAT port
+                    try:
+                        import docker as _docker
+                        _dc = _docker.from_env()
+                        _ctr = _dc.containers.get(app_conversation.sandbox_id)
+                        if _ctr.status == 'running':
+                            _bindings = _ctr.attrs.get('NetworkSettings', {}).get('Ports', {}).get('8011/tcp', [])
+                            if _bindings:
+                                _hp = _bindings[0].get('HostPort', '')
+                                if _hp:
+                                    conv_info.url = f'/api/sandbox-port/{_hp}/'
+                    except Exception:
+                        pass
                 return conv_info
         except (ValueError, TypeError, Exception):
             # Not a V1 conversation or service error
