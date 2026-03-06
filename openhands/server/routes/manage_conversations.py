@@ -705,14 +705,18 @@ async def get_shared_conversation_events(
     request: Request,
     conversation_id: str = Depends(validate_conversation_id),
     db_session: AsyncSession = db_session_dependency,
+    app_conversation_service: AppConversationService = app_conversation_service_dependency,
 ) -> JSONResponse:
-    """Get events for a shared conversation (public, requires valid share token)."""
+    """Get events for a shared conversation (public, requires valid share token).
+
+    Reads from filesystem first; if no meaningful events found, tries to sync
+    from the sandbox agent-server in real-time.
+    """
     from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
         StoredConversationMetadata,
     )
     from openhands.app_server.config import get_default_persistence_dir
     from openhands.sdk import Event
-    from pathlib import Path
     from sqlalchemy import select as sa_select
 
     share_token = request.query_params.get('share')
@@ -759,6 +763,41 @@ async def get_shared_conversation_events(
                 items.append(event.model_dump(mode='json'))
             except Exception:
                 pass
+
+    # If filesystem has few events, try sync from sandbox in real-time
+    if len(items) <= 1:
+        try:
+            conv_uuid = uuid.UUID(conversation_id)
+            app_conversation = await app_conversation_service.get_app_conversation(conv_uuid)
+            if app_conversation and app_conversation.conversation_url and app_conversation.session_api_key:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    await _sync_events_from_sandbox(
+                        conversation_id,
+                        app_conversation.conversation_url,
+                        app_conversation.session_api_key,
+                        user_id,
+                        client,
+                    )
+                # Re-read from filesystem after sync
+                items = []
+                if event_dir is None:
+                    # Event dir may have been created by sync
+                    for candidate in [
+                        persistence_dir / user_id / 'v1_conversations' / conv_hex if user_id else None,
+                        persistence_dir / 'v1_conversations' / conv_hex,
+                    ]:
+                        if candidate and candidate.exists():
+                            event_dir = candidate
+                            break
+                if event_dir:
+                    for path in sorted(event_dir.glob('*.json')):
+                        try:
+                            event = Event.model_validate_json(path.read_text())
+                            items.append(event.model_dump(mode='json'))
+                        except Exception:
+                            pass
+        except Exception:
+            logger.warning('Shared events: real-time sync failed', exc_info=True)
 
     return JSONResponse(content={'items': items, 'next_page_id': None})
 
