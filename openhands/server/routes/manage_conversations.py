@@ -608,7 +608,7 @@ async def get_conversation(
                             if _bindings:
                                 _hp = _bindings[0].get('HostPort', '')
                                 if _hp:
-                                    conv_info.url = f'/api/sandbox-port/{_hp}/'
+                                    conv_info.url = f'/api/sandbox-port/{_hp}'
                     except Exception:
                         pass
                 return conv_info
