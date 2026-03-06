@@ -1,0 +1,5 @@
+1. OpenHands is an AI-driven development platform that achieved an impressive 77.6 score on SWEBench, demonstrating its effectiveness at solving real-world software engineering tasks.
+
+2. The project offers multiple interfaces for different use cases: a composable Python SDK for building custom agents, a CLI tool for terminal-based workflows, a Local GUI with REST API, a Cloud hosted solution, and an Enterprise self-hosted option.
+
+3. OpenHands is primarily open source under the MIT license (current version 1.1.0), with the exception of the enterprise/ directory which requires a commercial license for extended use beyond one month.

@@ -170,7 +170,7 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
             except Exception as _exc:
                 import logging as _lg
                 _lg.getLogger('openhands').warning(
-                    f'SSE proxy WS connect failed for {conversation_id}: {type(_exc).__name__}: {_exc}'
+                    f'SSE proxy WS connect failed for {conversation_id} url={_url}: {type(_exc).__name__}: {_exc}'
                 )
             fail_count += 1
             yield ':heartbeat\n\n'
