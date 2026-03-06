@@ -185,11 +185,11 @@ async def api_proxy_events_stream(request: Request, conversation_id: str):
 async def api_proxy_send_event(conversation_id: str, request: Request):
     """[OH-MULTI-PERSESSION] Per-conversation routing: use _gtau for agent URL."""
     import httpx as _httpx, json as _json, uuid as _uuid
-    from openhands.server.routes.agent_server_proxy import _get_agent_server_key as _gask
+    from openhands.server.routes.agent_server_proxy import _get_tab_agent_key as _gtak, _get_agent_server_key as _gask
     body = await request.body()
     key = request.headers.get('X-Session-API-Key', '') or dict(request.query_params).get('session_api_key', '')
     if not key:
-        key = _gask()
+        key = _gtak(conversation_id) or _gask()
     try:
         conv_uuid = str(_uuid.UUID(conversation_id))
     except Exception:
@@ -216,8 +216,12 @@ async def api_proxy_send_event(conversation_id: str, request: Request):
                 headers={'X-Session-API-Key': key},
                 timeout=10.0,
             )
-    except Exception:
-        pass
+    except Exception as _exc:
+        import logging as _lg
+        _lg.getLogger('openhands').warning(
+            f'api_proxy_send_event failed for {conversation_id}: {type(_exc).__name__}: {_exc}'
+        )
+        return JSONResponse({'success': False, 'error': str(_exc)}, status_code=502)
     return JSONResponse({'success': True})
 
 

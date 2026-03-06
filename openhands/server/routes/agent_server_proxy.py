@@ -53,7 +53,9 @@ def _get_agent_server_port() -> int:
                 _agent_port_cache[1] = _t.time()
                 return port
         return 8000
-    except Exception:
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger('openhands').warning(f'_get_agent_server_port failed: {type(e).__name__}: {e}')
         return _agent_port_cache[0] or 8000
 
 
@@ -83,7 +85,9 @@ def _get_agent_server_key() -> str:
                 _agent_key_cache[1] = _t.time()
                 return key
         return ""
-    except Exception:
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger('openhands').warning(f'_get_agent_server_key failed: {type(e).__name__}: {e}')
         return _agent_key_cache[0]
 
 
@@ -243,8 +247,11 @@ async def proxy_sse(request: Request, conversation_id: str):
                     data = msg if isinstance(msg, str) else msg.decode()
                     data = data.replace("\n", "\\n")
                     yield f"data: {data}\n\n"
-        except Exception:
-            pass
+        except Exception as e:
+            import logging as _lg
+            _lg.getLogger('openhands').warning(
+                f'proxy_sse WS failed for {conversation_id}: {type(e).__name__}: {e}'
+            )
         yield "data: __closed__\n\n"
 
     return StreamingResponse(
@@ -307,8 +314,13 @@ async def proxy_send_event_ws(conversation_id: str, request: Request):
     try:
         async with websockets.connect(ws_url) as ws:
             await ws.send(body.decode())
-    except Exception:
-        pass
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger('openhands').warning(
+            f'proxy_send_event_ws failed for {conversation_id}: {type(e).__name__}: {e}'
+        )
+        return Response(content=_json_mod.dumps({"success": False, "error": str(e)}),
+                        status_code=502, media_type="application/json")
     return Response(content='{"success":true}', status_code=200, media_type="application/json")
 
 
