@@ -1,6 +1,4 @@
-"""
-Store class for managing users.
-"""
+"""Store class for managing users."""
 
 import asyncio
 import uuid
@@ -160,10 +158,7 @@ class UserStore:
         user_id: str,
         user_settings: UserSettings,
         user_info: dict,
-    ) -> User:
-        if not user_id or not user_settings:
-            return None
-
+    ) -> User | None:
         kwargs = decrypt_legacy_model(
             [
                 'llm_api_key',
@@ -300,29 +295,28 @@ class UserStore:
                 extra={'user_id': user_id},
             )
 
+            user_uuid = uuid.UUID(user_id)
+
             # need to migrate conversation metadata
             await session.execute(
                 text("""
                     INSERT INTO conversation_metadata_saas (conversation_id, user_id, org_id)
                     SELECT
                         conversation_id,
-                        :user_id,
-                        :user_id
+                        :user_uuid,
+                        :user_uuid
                     FROM conversation_metadata
-                    WHERE user_id = :user_id
+                    WHERE user_id = :user_id_text
                 """),
-                {'user_id': user_id},
+                {'user_uuid': user_uuid, 'user_id_text': user_id},
             )
-
-            # Update org_id for tables that had org_id added
-            user_uuid = uuid.UUID(user_id)
 
             # Update stripe_customers
             await session.execute(
                 text(
                     'UPDATE stripe_customers SET org_id = :org_id WHERE keycloak_user_id = :user_id'
                 ),
-                {'org_id': user_uuid, 'user_id': user_uuid},
+                {'org_id': user_uuid, 'user_id': user_id},
             )
 
             # Update slack_users
@@ -330,7 +324,7 @@ class UserStore:
                 text(
                     'UPDATE slack_users SET org_id = :org_id WHERE keycloak_user_id = :user_id'
                 ),
-                {'org_id': user_uuid, 'user_id': user_uuid},
+                {'org_id': user_uuid, 'user_id': user_id},
             )
 
             # Update slack_conversation
@@ -338,13 +332,13 @@ class UserStore:
                 text(
                     'UPDATE slack_conversation SET org_id = :org_id WHERE keycloak_user_id = :user_id'
                 ),
-                {'org_id': user_uuid, 'user_id': user_uuid},
+                {'org_id': user_uuid, 'user_id': user_id},
             )
 
             # Update api_keys
             await session.execute(
                 text('UPDATE api_keys SET org_id = :org_id WHERE user_id = :user_id'),
-                {'org_id': user_uuid, 'user_id': user_uuid},
+                {'org_id': user_uuid, 'user_id': user_id},
             )
 
             # Update custom_secrets
@@ -352,7 +346,7 @@ class UserStore:
                 text(
                     'UPDATE custom_secrets SET org_id = :org_id WHERE keycloak_user_id = :user_id'
                 ),
-                {'org_id': user_uuid, 'user_id': user_uuid},
+                {'org_id': user_uuid, 'user_id': user_id},
             )
 
             # Update billing_sessions
@@ -360,7 +354,7 @@ class UserStore:
                 text(
                     'UPDATE billing_sessions SET org_id = :org_id WHERE user_id = :user_id'
                 ),
-                {'org_id': user_uuid, 'user_id': user_uuid},
+                {'org_id': user_uuid, 'user_id': user_id},
             )
 
             await session.commit()
@@ -374,8 +368,7 @@ class UserStore:
 
     @staticmethod
     async def downgrade_user(user_id: str) -> UserSettings | None:
-        """
-        This method can be removed once orgs is established - probably after Feb 15 2026
+        """This method can be removed once orgs is established - probably after Feb 15 2026
         Downgrade a migrated user back to the pre-migration state.
 
         This reverses the migrate_user operation:
@@ -678,6 +671,12 @@ class UserStore:
                 if user_settings:
                     token_manager = TokenManager()
                     user_info = await token_manager.get_user_info_from_user_id(user_id)
+                    if not user_info:
+                        logger.warning(
+                            'user_store:get_user_by_id:failed_to_get_user_info',
+                            extra={'user_id': user_id},
+                        )
+                        return None
                     user = await UserStore.migrate_user(
                         user_id,
                         user_settings,
@@ -889,12 +888,14 @@ class UserStore:
 
         from openhands.storage.data_models.settings import Settings
 
-        settings = Settings(language='en', enable_proactive_conversation_starters=True)
+        default_settings = Settings(
+            language='en', enable_proactive_conversation_starters=True
+        )
 
         from storage.lite_llm_manager import LiteLlmManager
 
         settings = await LiteLlmManager.create_entries(
-            org_id, user_id, settings, create_user
+            org_id, user_id, default_settings, create_user
         )
         if not settings:
             logger.info(
@@ -1017,8 +1018,7 @@ class UserStore:
     def _has_custom_settings(
         user_settings: UserSettings, old_user_version: int | None
     ) -> bool:
-        """
-        Check if user has custom LLM settings that should be preserved.
+        """Check if user has custom LLM settings that should be preserved.
         Returns True if user customized either model or base_url.
 
         Args:
