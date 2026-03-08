@@ -18,8 +18,15 @@ export function transformVSCodeUrl(vsCodeUrl: string | null): string | null {
       url.hostname === "localhost" &&
       window.location.hostname !== "localhost"
     ) {
-      // Replace localhost with the current hostname
+      // [OH-MULTI] Convert to relative sandbox-port proxy URL so it's same-origin
+      // and same-protocol as the parent page (avoids cross-origin iframe warning).
+      // e.g. http://localhost:56025/?tkn=xxx → /api/sandbox-port/56025/?tkn=xxx
+      if (url.port) {
+        return `/api/sandbox-port/${url.port}${url.pathname}${url.search}`;
+      }
+      // Fallback: replace hostname + fix protocol
       url.hostname = window.location.hostname;
+      url.protocol = window.location.protocol;
       return url.toString();
     }
 
