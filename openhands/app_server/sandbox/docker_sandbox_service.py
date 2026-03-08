@@ -191,9 +191,15 @@ class DockerSandboxService(SandboxService):
 
                                 # [OH-MULTI-PERSESSION] Rewrite VSCODE/WORKER URLs to proxy path
                                 # Each container gets unique host ports; route browser through
-                                # /api/sandbox-port/{host_port} for per-session isolation
+                                # /api/sandbox-port/{host_port} for per-session isolation.
+                                # Apply whenever container URLs use localhost/127.0.0.1 (not
+                                # directly browser-accessible), regardless of container prefix.
+                                _needs_proxy = (
+                                    '127.0.0.1' in self.container_url_pattern
+                                    or 'localhost' in self.container_url_pattern
+                                )
                                 if (
-                                    self.container_name_prefix == 'oh-multi-'
+                                    _needs_proxy
                                     and matching_port.name != AGENT_SERVER
                                 ):
                                     if matching_port.name == VSCODE:
