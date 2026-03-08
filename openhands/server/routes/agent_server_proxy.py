@@ -159,11 +159,13 @@ def _get_tab_agent_key(conversation_id: str) -> str:
 
 
 def _get_oh_tab_container_for_port(host_port: int) -> dict:
-    """Find the oh-multi- container that has host_port mapped (Docker NAT).
+    """Find the sandbox container that has host_port mapped (Docker NAT).
+    Searches all running containers (not filtered by prefix) to support
+    any sandbox container prefix (oh-multi-, cda-, etc.).
     Returns container inspect data dict, or empty dict on failure."""
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
-        conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-multi-%22%5D%7D")
+        conn.request("GET", "/containers/json")
         resp = conn.getresponse()
         containers = _json_mod.loads(resp.read())
         for c in containers:
