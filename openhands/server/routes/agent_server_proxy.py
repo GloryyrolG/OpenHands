@@ -33,12 +33,12 @@ class _UnixHTTPConnection(_http_client.HTTPConnection):
         self.sock = s
 
 
-_agent_port_cache = [0, 0.0]
+_agent_port_cache: list[int | float] = [0, 0.0]
 def _get_agent_server_port() -> int:
     """Fallback: get host port of first oh-multi- container's port 8000 (cached 60s)."""
     import time as _t
-    if _agent_port_cache[0] and _t.time() - _agent_port_cache[1] < 60:
-        return _agent_port_cache[0]
+    if _agent_port_cache[0] and _t.time() - float(_agent_port_cache[1]) < 60:
+        return int(_agent_port_cache[0])
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
         conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-multi-%22%5D%7D")
@@ -51,20 +51,20 @@ def _get_agent_server_port() -> int:
                 port = port_info["PublicPort"]
                 _agent_port_cache[0] = port
                 _agent_port_cache[1] = _t.time()
-                return port
+                return int(port)
         return 8000
     except Exception as e:
         import logging as _lg
         _lg.getLogger('openhands').warning(f'_get_agent_server_port failed: {type(e).__name__}: {e}')
-        return _agent_port_cache[0] or 8000
+        return int(_agent_port_cache[0]) or 8000
 
 
-_agent_key_cache = ["", 0.0]
+_agent_key_cache: list[str | float] = ["", 0.0]
 def _get_agent_server_key() -> str:
     """Read session_api_key from first oh-multi- container via Docker API (cached 60s)."""
     import time as _t
-    if _agent_key_cache[0] and _t.time() - _agent_key_cache[1] < 60:
-        return _agent_key_cache[0]
+    if _agent_key_cache[0] and _t.time() - float(_agent_key_cache[1]) < 60:
+        return str(_agent_key_cache[0])
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
         conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-multi-%22%5D%7D")
@@ -88,16 +88,16 @@ def _get_agent_server_key() -> str:
     except Exception as e:
         import logging as _lg
         _lg.getLogger('openhands').warning(f'_get_agent_server_key failed: {type(e).__name__}: {e}')
-        return _agent_key_cache[0]
+        return str(_agent_key_cache[0])
 
 
-_oh_multi_ip_cache = ["", 0.0]
+_oh_multi_ip_cache: list[str | float] = ["", 0.0]
 def _get_oh_multi_ip() -> str:
     """Get bridge IP of first running oh-multi- container (cached 60s).
     Used for internal port access (user apps like Streamlit)."""
     import time as _t
-    if _oh_multi_ip_cache[0] and _t.time() - _oh_multi_ip_cache[1] < 60:
-        return _oh_multi_ip_cache[0]
+    if _oh_multi_ip_cache[0] and _t.time() - float(_oh_multi_ip_cache[1]) < 60:
+        return str(_oh_multi_ip_cache[0])
     try:
         conn = _UnixHTTPConnection("/var/run/docker.sock")
         conn.request("GET", "/containers/json?filters=%7B%22name%22%3A%5B%22oh-multi-%22%5D%7D")
@@ -116,7 +116,7 @@ def _get_oh_multi_ip() -> str:
             _oh_multi_ip_cache[1] = _t.time()
         return ip
     except Exception:
-        return _oh_multi_ip_cache[0]
+        return str(_oh_multi_ip_cache[0])
 
 
 _key_cache: dict = {}  # cid -> (key, timestamp)
