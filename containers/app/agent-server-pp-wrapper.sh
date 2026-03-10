@@ -1,0 +1,38 @@
+#!/bin/bash
+/usr/local/bin/openhands-agent-server-orig "$@" &
+PID=$!
+
+for i in $(seq 1 50); do
+    DIR=$(find /tmp/_MEI* -maxdepth 0 -type d 2>/dev/null | head -1)
+    if [ -n "$DIR" ]; then
+        # CDA branding
+        find "$DIR" -name "system_prompt*.j2" -exec sed -i 's/OpenHands/CDA/g' {} + 2>/dev/null
+        # APP_AUTO_DEPLOY instruction (append once)
+        find "$DIR" -name "system_prompt*.j2" | while read f; do
+            if ! grep -q 'APP_AUTO_DEPLOY' "$f" 2>/dev/null; then
+                cat >> "$f" << 'PROMPT_EOF'
+
+<APP_AUTO_DEPLOY>
+When you finish writing a web application (Streamlit, Gradio, FastAPI, Flask, or any web framework), automatically start it in the background on port 8011 so users can preview it immediately.
+
+Rules:
+- Always bind to host 0.0.0.0 and port 8011
+- Start in background so it does not block further actions
+- After starting, wait 3 seconds then verify: curl -s -o /dev/null -w '%{http_code}' http://localhost:8011
+
+Common start commands:
+- Streamlit:  nohup streamlit run app.py --server.port 8011 --server.address 0.0.0.0 > /tmp/app.log 2>&1 &
+- Gradio:     ensure launch(server_port=8011, server_name="0.0.0.0") then run
+- FastAPI:    nohup uvicorn main:app --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &
+- Flask:      nohup flask run --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &
+- Node/Next:  nohup npm run dev -- --port 8011 > /tmp/app.log 2>&1 &
+</APP_AUTO_DEPLOY>
+PROMPT_EOF
+            fi
+        done
+        break
+    fi
+    sleep 0.1
+done
+
+wait $PID
