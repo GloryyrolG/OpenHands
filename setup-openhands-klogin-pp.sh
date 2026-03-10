@@ -129,15 +129,23 @@ else
 fi
 echo "源码就绪 ✓"
 
-# 构建 Docker 镜像（第一次较慢，约 10-20 分钟）
-echo ">>> 构建 Docker 镜像..."
+# 构建自定义 agent-server 镜像（含 CDA 品牌 + APP_AUTO_DEPLOY system prompt patch）
+echo ">>> 构建 agent-server-pp 镜像..."
 cd /tmp/openhands-pp
+sudo docker build \
+    -f containers/app/Dockerfile.agent-server-pp \
+    -t agent-server-pp:latest \
+    .
+echo "agent-server-pp 镜像构建完成 ✓"
+
+# 构建主应用镜像（第一次较慢，约 10-20 分钟）
+echo ">>> 构建主应用 Docker 镜像..."
 sudo docker build \
     -f containers/app/Dockerfile.multiuser \
     -t openhands-pp:latest \
     --build-arg OPENHANDS_BUILD_VERSION=pp-\$(git rev-parse --short HEAD 2>/dev/null || echo "dev") \
     .
-echo "镜像构建完成 ✓"
+echo "主应用镜像构建完成 ✓"
 
 # 启动容器
 echo ">>> 启动 OpenHands multiuser..."
@@ -145,8 +153,8 @@ sudo docker run -d \
     --name openhands-app-pp \
     --network host \
     -e SANDBOX_USER_ID=0 \
-    -e AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server \
-    -e AGENT_SERVER_IMAGE_TAG=1.10.0-python \
+    -e AGENT_SERVER_IMAGE_REPOSITORY=agent-server-pp \
+    -e AGENT_SERVER_IMAGE_TAG=latest \
     -e LOG_ALL_EVENTS=true \
     -e SANDBOX_STARTUP_GRACE_SECONDS=120 \
     -e SANDBOX_CONTAINER_PREFIX=oh-pp- \

@@ -22,7 +22,7 @@ export const useUserConversation = (
   shareToken?: string | null,
 ) =>
   useQuery({
-    queryKey: ["user", "conversation", cid, shareToken],
+    queryKey: ["user", "conversation", cid, shareToken ?? null],
     queryFn: async () => {
       if (!cid) return null;
 

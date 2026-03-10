@@ -5,6 +5,7 @@ import { ResizeHandle } from "../../../ui/resize-handle";
 import { useResizablePanels } from "#/hooks/use-resizable-panels";
 import { useConversationStore } from "#/stores/conversation-store";
 import { useBreakpoint } from "#/hooks/use-breakpoint";
+import { useAutoSwitchToAppTab } from "#/hooks/use-auto-switch-to-app-tab";
 
 function getMobileChatPanelClass(isRightPanelShown: boolean) {
   return isRightPanelShown ? "h-160" : "flex-1";
@@ -17,6 +18,7 @@ function getDesktopTabPanelClass(isRightPanelShown: boolean) {
 }
 
 export function ConversationMain() {
+  useAutoSwitchToAppTab();
   const isMobile = useBreakpoint();
   const { isRightPanelShown } = useConversationStore();
 
