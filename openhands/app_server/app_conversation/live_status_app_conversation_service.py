@@ -1214,6 +1214,10 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             ]
 
         # Create and return the final request
+        # stuck_detection=False: Gemini Flash sometimes generates text-only responses
+        # (no tool call) between steps, which triggers false-positive stuck detection
+        # after 3 consecutive agent messages. TOOL_DISCIPLINE in the system prompt
+        # handles model behavior; max_iterations remains as the safety backstop.
         return StartConversationRequest(
             conversation_id=conversation_id,
             agent=agent,
@@ -1224,6 +1228,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             initial_message=final_initial_message,
             secrets=secrets,
             plugins=sdk_plugins,
+            stuck_detection=False,
         )
 
     async def _build_start_conversation_request_for_user(

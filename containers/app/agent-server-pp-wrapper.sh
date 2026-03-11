@@ -27,6 +27,14 @@ else
     find "$DIR" -name "system_prompt*.j2" -exec sed -i 's/OpenHands/CDA/g' {} + 2>/dev/null
     echo "[pp-wrapper] applied CDA branding" >&2
 
+    # TOOL_DISCIPLINE — prevent model from generating text-only responses (empty MessageAction bug)
+    for f in $PROMPT_FILES; do
+        if ! grep -q 'TOOL_DISCIPLINE' "$f" 2>/dev/null; then
+            printf '\n<TOOL_DISCIPLINE>\nCRITICAL: Every response MUST call exactly one tool. NEVER produce a text-only response without calling a tool. Put all reasoning/analysis in the "thought" field of your tool call — not as a standalone text response. If the task is complete, call the Finish tool. If you need to think, call the bash tool with an echo command. A response without a tool call will immediately terminate the session with an error.\n</TOOL_DISCIPLINE>\n' >> "$f" 2>/dev/null
+            echo "[pp-wrapper] appended TOOL_DISCIPLINE to $f, exit=$?" >&2
+        fi
+    done
+
     # WEB_PREVIEW instruction — tells agent to auto-deploy on 8011 so the preview panel shows it
     for f in $PROMPT_FILES; do
         if ! grep -q 'WEB_PREVIEW' "$f" 2>/dev/null; then
