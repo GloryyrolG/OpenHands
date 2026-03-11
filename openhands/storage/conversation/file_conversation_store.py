@@ -48,8 +48,13 @@ class FileConversationStore(ConversationStore):
         path = self.get_conversation_metadata_filename(conversation_id)
         json_str = await call_sync_from_async(self.file_store.read, path)
 
-        # Validate the JSON
-        json_obj = json.loads(json_str)
+        # Parse only the first valid JSON object; extra trailing data is ignored
+        # to handle corruption where a previous write left stale bytes.
+        try:
+            json_obj, _ = json.JSONDecoder().raw_decode(json_str.strip())
+        except json.JSONDecodeError:
+            json_obj = json.loads(json_str)  # raises with original error
+
         if 'created_at' not in json_obj:
             raise FileNotFoundError(path)
 
