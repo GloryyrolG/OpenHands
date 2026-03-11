@@ -1,3 +1,9 @@
+# Dockerfile.agent-server-pp: CDA custom agent-server image
+# Patches system_prompt*.j2 at container startup:
+#   - Replaces "OpenHands" -> "CDA" (branding)
+#   - Injects WEB_PREVIEW instruction (auto-deploy on port 8011 -> preview panel)
+# Build: docker build -f containers/app/Dockerfile.agent-server-pp -t agent-server-pp:latest .
+
 FROM ghcr.io/openhands/agent-server:1.10.0-python
 
 USER root

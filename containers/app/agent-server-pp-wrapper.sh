@@ -27,11 +27,11 @@ else
     find "$DIR" -name "system_prompt*.j2" -exec sed -i 's/OpenHands/CDA/g' {} + 2>/dev/null
     echo "[pp-wrapper] applied CDA branding" >&2
 
-    # APP_AUTO_DEPLOY instruction (use printf to avoid heredoc/pipe subshell issues)
+    # WEB_PREVIEW instruction — tells agent to auto-deploy on 8011 so the preview panel shows it
     for f in $PROMPT_FILES; do
-        if ! grep -q 'APP_AUTO_DEPLOY' "$f" 2>/dev/null; then
-            printf '\n<APP_AUTO_DEPLOY>\nWhen you finish writing a web application (Streamlit, Gradio, FastAPI, Flask, or any web framework), automatically start it in the background on port 8011 so users can preview it immediately.\n\nRules:\n- Always bind to host 0.0.0.0 and port 8011\n- Start in background so it does not block further actions\n- After starting, wait 3 seconds then verify: curl -s -o /dev/null -w '"'"'%%{http_code}'"'"' http://localhost:8011\n\nCommon start commands:\n- Streamlit:  nohup streamlit run app.py --server.port 8011 --server.address 0.0.0.0 > /tmp/app.log 2>&1 &\n- Gradio:     ensure launch(server_port=8011, server_name="0.0.0.0") then run\n- FastAPI:    nohup uvicorn main:app --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &\n- Flask:      nohup flask run --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &\n- Node/Next:  nohup npm run dev -- --port 8011 > /tmp/app.log 2>&1 &\n</APP_AUTO_DEPLOY>\n' >> "$f" 2>/dev/null
-            echo "[pp-wrapper] appended APP_AUTO_DEPLOY to $f, exit=$?" >&2
+        if ! grep -q 'WEB_PREVIEW' "$f" 2>/dev/null; then
+            printf '\n<WEB_PREVIEW>\nAfter you finish building any web application, ALWAYS start it immediately on port 8011 — do not wait for the user to ask. The running app will automatically appear in the preview panel on the right side of the screen.\n\n- Run in background: nohup ... > /tmp/app.log 2>&1 &\n- After starting, verify it is live: sleep 2 && curl -s -o /dev/null -w '"'"'%%{http_code}'"'"' http://localhost:8011\n- If it fails to start, show the user the error: cat /tmp/app.log\n\nStart commands (always bind to 0.0.0.0:8011):\n  Streamlit: nohup streamlit run app.py --server.port 8011 --server.address 0.0.0.0 > /tmp/app.log 2>&1 &\n  FastAPI:   nohup uvicorn main:app --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &\n  Flask:     nohup flask run --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &\n  Gradio:    use launch(server_port=8011, server_name="0.0.0.0")\n  Node/Next: nohup npm run dev -- --port 8011 > /tmp/app.log 2>&1 &\n  Django:    nohup python manage.py runserver 0.0.0.0:8011 > /tmp/app.log 2>&1 &\n</WEB_PREVIEW>\n' >> "$f" 2>/dev/null
+            echo "[pp-wrapper] appended WEB_PREVIEW to $f, exit=$?" >&2
         fi
     done
     echo "[pp-wrapper] patch complete" >&2
