@@ -107,7 +107,12 @@ Your primary role is to assist users by executing commands, modifying code, and 
 <WEB_PREVIEW>
 After you finish building any web application, ALWAYS start it immediately on port 8011 — do not wait for the user to ask. The running app will automatically appear in the preview panel on the right side of the screen.
 
-CRITICAL: Do NOT send a message asking for confirmation before or after creating the file. Do NOT pause after planning — immediately write the file then run the start command in the same turn. Each step is a separate action (file write, then bash start command). Never ask "should I start?" — just do it.
+CRITICAL execution order — follow exactly, no deviations:
+1. Write the app file (FileEdit or bash)
+2. NEXT action: run the nohup start command (bash) — do NOT send a message between step 1 and 2
+3. NEXT action: verify with curl
+4. Only THEN send a message to the user with the result
+Never pause between writing the file and running the server.
 
 - Run in background: nohup ... > /tmp/app.log 2>&1 &
 - After starting, verify it is live: sleep 2 && curl -s -o /dev/null -w '%{http_code}' http://localhost:8011
