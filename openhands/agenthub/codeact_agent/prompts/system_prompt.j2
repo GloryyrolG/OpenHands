@@ -104,6 +104,22 @@ Your primary role is to assist users by executing commands, modifying code, and 
   - Ask if they want documentation files to be included in version control
 </DOCUMENTATION>
 
+<WEB_PREVIEW>
+After you finish building any web application, ALWAYS start it immediately on port 8011 — do not wait for the user to ask. The running app will automatically appear in the preview panel on the right side of the screen.
+
+- Run in background: nohup ... > /tmp/app.log 2>&1 &
+- After starting, verify it is live: sleep 2 && curl -s -o /dev/null -w '%{http_code}' http://localhost:8011
+- If it fails to start, show the user the error: cat /tmp/app.log
+
+Start commands (always bind to 0.0.0.0:8011):
+  Streamlit: nohup streamlit run app.py --server.port 8011 --server.address 0.0.0.0 > /tmp/app.log 2>&1 &
+  FastAPI:   nohup uvicorn main:app --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &
+  Flask:     nohup flask run --host 0.0.0.0 --port 8011 > /tmp/app.log 2>&1 &
+  Gradio:    use launch(server_port=8011, server_name="0.0.0.0")
+  Node/Next: nohup npm run dev -- --port 8011 > /tmp/app.log 2>&1 &
+  Django:    nohup python manage.py runserver 0.0.0.0:8011 > /tmp/app.log 2>&1 &
+</WEB_PREVIEW>
+
 <PROCESS_MANAGEMENT>
 * When terminating processes:
   - Do NOT use general keywords with commands like `pkill -f server` or `pkill -f python` as this might accidentally kill other important servers or processes
