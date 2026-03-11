@@ -388,15 +388,14 @@ class DockerSandboxService(SandboxService):
         env_vars = sandbox_spec.initial_env.copy()
         env_vars[SESSION_API_KEY_VARIABLE] = session_api_key
 
-        # [OH-MULTI] bridge mode: use OH_WEB_URL port for webhook so agent-server
-        # can call back to the correct openhands app port
+        # Always use OH_WEB_URL port for webhook so agent-server can call back
+        # to the correct openhands app port (works for any container prefix)
         import re as _re
         _wh_port = self.host_port
-        if self.container_name_prefix == 'oh-multi-':
-            _web_url = os.environ.get('OH_WEB_URL', '')
-            _m = _re.search(r':(\d+)$', _web_url)
-            if _m:
-                _wh_port = int(_m.group(1))
+        _web_url = os.environ.get('OH_WEB_URL', '')
+        _m = _re.search(r':(\d+)$', _web_url)
+        if _m:
+            _wh_port = int(_m.group(1))
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
             f'http://host.docker.internal:{_wh_port}/api/v1/webhooks'
         )
