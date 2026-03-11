@@ -173,18 +173,21 @@ export default function MainApp() {
     setLoginMethodExists(checkLoginMethodExists());
   }, [isAuthed, checkLoginMethodExists]);
 
+  // Show loading spinner while config or auth is loading
+  const isLoading = config.isLoading || isAuthLoading;
+
   // [OH-MULTI] Skip login redirect when share token is present
   const hasShareToken = searchParams.has("share");
 
+  // Only decide to redirect AFTER loading completes
   const shouldRedirectToLogin =
-    config.isLoading ||
-    isAuthLoading ||
-    (!isAuthed &&
-      !isAuthError &&
-      !isOnIntermediatePage &&
-      !hasShareToken &&
-      config.data?.app_mode === "saas" &&
-      !loginMethodExists);
+    !isLoading &&
+    !isAuthed &&
+    !isAuthError &&
+    !isOnIntermediatePage &&
+    !hasShareToken &&
+    config.data?.app_mode === "saas" &&
+    !loginMethodExists;
 
   React.useEffect(() => {
     if (shouldRedirectToLogin) {
@@ -201,7 +204,8 @@ export default function MainApp() {
     }
   }, [shouldRedirectToLogin, pathname, searchParams, navigate]);
 
-  if (shouldRedirectToLogin) {
+  // Show loading spinner while loading OR when about to redirect
+  if (isLoading || shouldRedirectToLogin) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-base">
         <LoadingSpinner size="large" />
