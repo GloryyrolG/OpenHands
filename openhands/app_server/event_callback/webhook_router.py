@@ -90,8 +90,12 @@ async def valid_conversation(
             sandbox_id=sandbox_info.id,
             created_by_user_id=sandbox_info.created_by_user_id,
         )
-    if app_conversation_info.created_by_user_id != sandbox_info.created_by_user_id:
-        # Make sure that the conversation and sandbox were created by the same user
+    if (
+        sandbox_info.created_by_user_id is not None
+        and app_conversation_info.created_by_user_id != sandbox_info.created_by_user_id
+    ):
+        # Make sure that the conversation and sandbox were created by the same user.
+        # Skip this check when sandbox has no user_id (Docker mode).
         raise AuthError()
     return app_conversation_info
 
