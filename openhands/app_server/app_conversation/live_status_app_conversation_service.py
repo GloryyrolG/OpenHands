@@ -729,12 +729,22 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         if model and model.startswith('openhands/'):
             base_url = user.llm_base_url or self.openhands_provider_base_url
 
-        return LLM(
+        # Gemini Flash/Lite: SDK default reasoning_effort='high' triggers
+        # extended thinking (budget_tokens), which returns only opaque thinking
+        # blocks with no visible content → empty-response loop. Disable for Flash.
+        model_str = (model or '').lower()
+        is_flash = 'flash' in model_str or 'lite' in model_str
+        kwargs: dict = dict(
             model=model,
             base_url=base_url,
             api_key=user.llm_api_key,
             usage_id='agent',
         )
+        if is_flash:
+            kwargs['reasoning_effort'] = None
+            kwargs['extended_thinking_budget'] = None
+
+        return LLM(**kwargs)
 
     async def _get_tavily_api_key(self, user: UserInfo) -> str | None:
         """Get Tavily search API key, prioritizing user's key over service key.
