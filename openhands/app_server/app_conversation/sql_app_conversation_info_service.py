@@ -366,6 +366,10 @@ class SQLAppConversationInfoService(AppConversationInfoService):
         if existing and existing.share_token:
             stored.share_token = existing.share_token
 
+        # Preserve existing user_id when webhook context has no user_id (Docker sandbox)
+        if existing and existing.user_id and user_id is None:
+            stored.user_id = existing.user_id
+
         await self.db_session.merge(stored)
         await self.db_session.commit()
         return info
