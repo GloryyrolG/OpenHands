@@ -8,6 +8,21 @@ FROM ghcr.io/openhands/agent-server:1.10.0-python
 
 USER root
 
+# Block public skills download: redirect the GitHub skills repo to a local empty repo.
+# Without this, the SDK clones 59 public skills (~56KB) on every container start,
+# pushing the system prompt past the SDK's 50KB TextContent limit → Flash empty responses.
+RUN git -c user.email="pp@cda" -c user.name="pp" init /tmp/empty-skills-work && \
+    cd /tmp/empty-skills-work && \
+    git -c user.email="pp@cda" -c user.name="pp" commit --allow-empty -m "init" && \
+    git clone --bare /tmp/empty-skills-work /opt/empty-skills.git && \
+    rm -rf /tmp/empty-skills-work && \
+    chown -R openhands:openhands /opt/empty-skills.git
+
+USER openhands
+RUN git config --global url."file:///opt/empty-skills.git".insteadOf "https://github.com/OpenHands/skills"
+
+USER root
+
 RUN mv /usr/local/bin/openhands-agent-server /usr/local/bin/openhands-agent-server-orig
 
 COPY containers/app/agent-server-pp-wrapper.sh /usr/local/bin/openhands-agent-server
