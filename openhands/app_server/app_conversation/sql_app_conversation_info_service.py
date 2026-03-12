@@ -326,6 +326,12 @@ class SQLAppConversationInfoService(AppConversationInfoService):
 
         # Write user_id for per-user isolation
         user_id = await self.user_context.get_user_id()
+        logger.info(
+            'save_app_conversation_info: conv=%s user_id=%s info.created_by=%s',
+            str(info.id)[:8],
+            user_id,
+            info.created_by_user_id,
+        )
 
         stored = StoredConversationMetadata(
             conversation_id=str(info.id),

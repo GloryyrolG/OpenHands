@@ -743,6 +743,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         if is_flash:
             kwargs['reasoning_effort'] = None
             kwargs['extended_thinking_budget'] = None
+            # enable_encrypted_reasoning=True (SDK default) causes Flash to return
+            # encrypted thinking blocks even when reasoning_effort is None.
+            # The proxy converts them to tsig tool_use with no tool_result,
+            # accumulating 160+ unresolved messages → Endor strips them → empty loop.
+            kwargs['enable_encrypted_reasoning'] = False
 
         return LLM(**kwargs)
 
