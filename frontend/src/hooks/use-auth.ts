@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   getStoredToken,
   setStoredToken,
@@ -7,7 +8,6 @@ import {
   setStoredUser,
   login as apiLogin,
   register as apiRegister,
-  getCurrentUser,
   verifyToken,
   type LoginRequest,
   type RegisterRequest,
@@ -22,6 +22,7 @@ interface AuthState {
 }
 
 export function useAuth() {
+  const queryClient = useQueryClient();
   const [authState, setAuthState] = useState<AuthState>({
     isAuthenticated: false,
     isLoading: true,
@@ -62,39 +63,49 @@ export function useAuth() {
     checkAuth();
   }, []);
 
-  const login = useCallback(async (data: LoginRequest) => {
-    const response = await apiLogin(data);
-    const { token, user } = response;
+  const login = useCallback(
+    async (data: LoginRequest) => {
+      const response = await apiLogin(data);
+      const { token, user } = response;
 
-    setStoredToken(token);
-    setStoredUser(user);
+      setStoredToken(token);
+      setStoredUser(user);
+      // Invalidate stale isAuthed cache so root-layout sees true immediately
+      queryClient.invalidateQueries({ queryKey: ["user", "authenticated"] });
 
-    setAuthState({
-      isAuthenticated: true,
-      isLoading: false,
-      user,
-      token,
-    });
+      setAuthState({
+        isAuthenticated: true,
+        isLoading: false,
+        user,
+        token,
+      });
 
-    return response;
-  }, []);
+      return response;
+    },
+    [queryClient],
+  );
 
-  const register = useCallback(async (data: RegisterRequest) => {
-    const response = await apiRegister(data);
-    const { token, user } = response;
+  const register = useCallback(
+    async (data: RegisterRequest) => {
+      const response = await apiRegister(data);
+      const { token, user } = response;
 
-    setStoredToken(token);
-    setStoredUser(user);
+      setStoredToken(token);
+      setStoredUser(user);
+      // Invalidate stale isAuthed cache so root-layout sees true immediately
+      queryClient.invalidateQueries({ queryKey: ["user", "authenticated"] });
 
-    setAuthState({
-      isAuthenticated: true,
-      isLoading: false,
-      user,
-      token,
-    });
+      setAuthState({
+        isAuthenticated: true,
+        isLoading: false,
+        user,
+        token,
+      });
 
-    return response;
-  }, []);
+      return response;
+    },
+    [queryClient],
+  );
 
   const logout = useCallback(() => {
     removeStoredToken();
