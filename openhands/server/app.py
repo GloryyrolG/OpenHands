@@ -17,6 +17,7 @@ with warnings.catch_warnings():
     warnings.simplefilter('ignore')
 
 from fastapi import (
+    Depends,
     FastAPI,
     Request,
 )
@@ -31,6 +32,7 @@ from openhands.server.routes.agent_server_proxy import agent_proxy_router
 
 # 新增多用户认证路由
 from openhands.server.routes.auth import app as auth_router
+from openhands.server.routes.auth import get_current_user
 from openhands.server.routes.conversation import app as conversation_api_router
 from openhands.server.routes.feedback import app as feedback_api_router
 from openhands.server.routes.files import app as files_api_router
@@ -97,6 +99,14 @@ app.include_router(agent_proxy_router)
 app.include_router(public_api_router)
 app.include_router(auth_router)  # 新增认证路由
 app.include_router(files_api_router)
+
+
+@app.post('/api/authenticate')
+async def authenticate(current_user=Depends(get_current_user)):
+    """Frontend auth check: returns 200 if JWT is valid, 401 otherwise."""
+    return {'message': 'Authenticated'}
+
+
 app.include_router(security_api_router)
 app.include_router(feedback_api_router)
 app.include_router(conversation_api_router)
