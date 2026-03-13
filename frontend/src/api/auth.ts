@@ -63,6 +63,7 @@ export async function verifyToken(token: string): Promise<boolean> {
 // Token management
 const TOKEN_KEY = "auth_token";
 const USER_KEY = "auth_user";
+const LOGIN_METHOD_KEY = "openhands_login_method";
 
 export function getStoredToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -70,11 +71,14 @@ export function getStoredToken(): string | null {
 
 export function setStoredToken(token: string): void {
   localStorage.setItem(TOKEN_KEY, token);
+  // Mark login method so root-layout doesn't redirect to /login
+  localStorage.setItem(LOGIN_METHOD_KEY, "email");
 }
 
 export function removeStoredToken(): void {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
+  localStorage.removeItem(LOGIN_METHOD_KEY);
 }
 
 export function getStoredUser(): User | null {
