@@ -107,6 +107,12 @@ async def authenticate(current_user=Depends(get_current_user)):
     return {'message': 'Authenticated'}
 
 
+@app.post('/api/logout')
+async def logout():
+    """Frontend logout: JWT is stateless, client clears the token."""
+    return {'message': 'Logged out'}
+
+
 app.include_router(security_api_router)
 app.include_router(feedback_api_router)
 app.include_router(conversation_api_router)
