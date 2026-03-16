@@ -12,6 +12,8 @@ This is similar to the functionality of `CodeActResponseParser`.
 
 import json
 
+from json_repair import repair_json
+
 from litellm import (
     ModelResponse,
 )
@@ -100,10 +102,13 @@ def response_to_actions(
             logger.debug(f'Tool call in function_calling.py: {tool_call}')
             try:
                 arguments = json.loads(tool_call.function.arguments)
-            except json.decoder.JSONDecodeError as e:
-                raise FunctionCallValidationError(
-                    f'Failed to parse tool call arguments: {tool_call.function.arguments}'
-                ) from e
+            except json.decoder.JSONDecodeError:
+                try:
+                    arguments = json.loads(repair_json(tool_call.function.arguments))
+                except (json.decoder.JSONDecodeError, ValueError, TypeError) as e:
+                    raise FunctionCallValidationError(
+                        f'Failed to parse tool call arguments: {tool_call.function.arguments}'
+                    ) from e
 
             # ================================================
             # CmdRunTool (Bash)
